@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -15,10 +16,12 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 
 
-DEFAULT_SERVICE_ROOT = Path(os.getenv("TMCRA_SERVICE_ROOT", "./tmcra_api_service"))
-DEFAULT_REPO = Path(os.getenv("TMCRA_REPO_ROOT", str(DEFAULT_SERVICE_ROOT / "private" / "tmcra-integrated")))
-DEFAULT_DATA = Path(os.getenv("LONGMEMEVAL_S_DATA", "./data/longmemeval_s_cleaned.json"))
-DEFAULT_OUT_ROOT = Path(os.getenv("TMCRA_LME_RUN_ROOT", "./runs"))
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = PACKAGE_ROOT.parents[1]
+DEFAULT_SERVICE_ROOT = PROJECT_ROOT
+DEFAULT_REPO = PACKAGE_ROOT / "vendor" / "tmcra_integrated"
+DEFAULT_DATA = PROJECT_ROOT / "data" / "longmemeval_s_cleaned.json"
+DEFAULT_OUT_ROOT = PROJECT_ROOT / "runs"
 
 
 def log(event: str, **payload: Any) -> None:
@@ -166,6 +169,49 @@ def chat_completion(
     api_key: str = "",
 ) -> str:
     wire_api = clean_text(os.getenv("TMCRA_ANSWER_WIRE_API", os.getenv("OPENAI_WIRE_API", ""))).lower()
+    reasoning_effort = clean_text(os.getenv("TMCRA_CHAT_COMPLETION_REASONING_EFFORT", ""))
+    reasoning_models = {
+        item.strip().lower()
+        for item in os.getenv("TMCRA_CHAT_COMPLETION_REASONING_EFFORT_MODELS", "").split(",")
+        if item.strip()
+    }
+    model_l = clean_text(model).lower()
+    reasoning_model_allowed = (
+        model_l in reasoning_models
+        if reasoning_models
+        else (
+            "vectorengine.ai" in base_url.lower()
+            or "api.openai.com" in base_url.lower()
+            or model_l.startswith(("gpt-", "gpt5", "gpt4"))
+        )
+    )
+    reasoning_effort_allowed = bool(reasoning_effort and reasoning_model_allowed)
+    cache_mode = os.getenv("TMCRA_LLM_CACHE_MODE", "").strip().lower()
+    cache_dir_raw = os.getenv("TMCRA_LLM_CACHE_DIR", "").strip()
+    cache_path: Path | None = None
+    if cache_mode in {"record", "replay"} and cache_dir_raw:
+        cache_key_payload = {
+            "schema_version": 1,
+            "wire_api": wire_api or "chat_completions",
+            "base_url": base_url.rstrip("/"),
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "reasoning_effort": reasoning_effort if reasoning_effort_allowed else "",
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(cache_key_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cache_path = Path(cache_dir_raw) / f"{cache_key}.json"
+    if cache_mode == "replay":
+        if cache_path is None:
+            raise RuntimeError("TMCRA_LLM_CACHE_MODE=replay requires TMCRA_LLM_CACHE_DIR")
+        if not cache_path.exists():
+            raise RuntimeError(f"missing LLM cache entry: {cache_path}")
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        return str(cached.get("text", ""))
+
     if wire_api == "responses":
         body = http_json(
             "POST",
@@ -181,6 +227,14 @@ def chat_completion(
         )
         output_text = clean_text(body.get("output_text", ""))
         if output_text:
+            if cache_mode == "record" and cache_path is not None:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+                tmp_path.write_text(
+                    json.dumps({"schema_version": 1, "text": output_text}, ensure_ascii=False, sort_keys=True),
+                    encoding="utf-8",
+                )
+                tmp_path.replace(cache_path)
             return output_text
         chunks: list[str] = []
         for item in body.get("output", []) or []:
@@ -188,7 +242,16 @@ def chat_completion(
                 text = content.get("text") or content.get("content") or ""
                 if text:
                     chunks.append(str(text))
-        return "\n".join(chunks).strip()
+        response_text = "\n".join(chunks).strip()
+        if cache_mode == "record" and cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            tmp_path.write_text(
+                json.dumps({"schema_version": 1, "text": response_text}, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            tmp_path.replace(cache_path)
+        return response_text
     body = http_json(
         "POST",
         base_url.rstrip("/") + "/chat/completions",
@@ -198,11 +261,21 @@ def chat_completion(
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort_allowed else {}),
         },
         timeout=360,
         api_key=api_key,
     )
-    return (((body.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    response_text = (((body.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    if cache_mode == "record" and cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps({"schema_version": 1, "text": response_text}, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp_path.replace(cache_path)
+    return response_text
 
 
 def answer_llm_config() -> tuple[str, str, str]:
@@ -220,20 +293,6 @@ def answer_llm_config() -> tuple[str, str, str]:
         os.getenv("GEMMA_MODEL", os.getenv("TMCRA_GEMMA_MODEL_NAME", "gemma-4-e4b-it")),
         clean_text(os.getenv("GEMMA_API_KEY", "")),
     )
-
-
-def query_graph_llm_config() -> tuple[str, str, str]:
-    base_url = clean_text(os.getenv("TMCRA_QUERY_GRAPH_BASE_URL", ""))
-    model = clean_text(os.getenv("TMCRA_QUERY_GRAPH_MODEL", ""))
-    api_key = clean_text(os.getenv("TMCRA_QUERY_GRAPH_API_KEY", ""))
-    if base_url or model or api_key:
-        answer_base_url, answer_model, answer_api_key = answer_llm_config()
-        return (
-            base_url or answer_base_url,
-            model or answer_model,
-            api_key or answer_api_key,
-        )
-    return answer_llm_config()
 
 
 def clean_text(value: Any) -> str:
@@ -389,6 +448,38 @@ def disable_topic_bucket_runtime() -> None:
 def writer_ingest(adapter: Any, writer: Any, text: str, *, qid: str, chunk_id: str) -> dict[str, Any]:
     from experiments.replacement.semantic_memory_writer import build_modelized_facet_unit_records
 
+    cache_mode = os.getenv("TMCRA_WRITER_CACHE_MODE", "").strip().lower()
+    cache_dir_raw = os.getenv("TMCRA_WRITER_CACHE_DIR", "").strip()
+    cache_path: Path | None = None
+    if cache_mode in {"record", "replay"} and cache_dir_raw:
+        safe_qid = re.sub(r"[^A-Za-z0-9_.-]+", "_", qid)[:120] or "sample"
+        safe_chunk_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", chunk_id)[:80] or "chunk"
+        cache_path = Path(cache_dir_raw) / f"{safe_qid}__{safe_chunk_id}.json"
+    if cache_mode == "replay":
+        if cache_path is None:
+            raise RuntimeError("TMCRA_WRITER_CACHE_MODE=replay requires TMCRA_WRITER_CACHE_DIR")
+        if not cache_path.exists():
+            raise RuntimeError(f"missing writer cache entry: {cache_path}")
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        cached_text = str(cached.get("text", ""))
+        if cached_text != text:
+            raise RuntimeError(f"writer cache text mismatch for {qid}/{chunk_id}")
+        timestamp = str(cached.get("timestamp", ""))
+        payload = dict(cached.get("payload") or {})
+        if not timestamp or not payload:
+            raise RuntimeError(f"invalid writer cache entry: {cache_path}")
+        adapter.ingest_turn(
+            f"[{timestamp}] user: {text}",
+            assistant_text="",
+            answer_payload=payload,
+            extraction_result={},
+        )
+        result = dict(cached.get("result") or {})
+        result["seconds"] = 0.0
+        result["writer_cache_mode"] = "replay"
+        result["writer_cache_path"] = str(cache_path)
+        return result
+
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     sidecar_hints = {
         "metadata": {
@@ -438,13 +529,14 @@ def writer_ingest(adapter: Any, writer: Any, text: str, *, qid: str, chunk_id: s
         replacement_records.extend(unit_records)
         payload["replacement_memory_records"] = replacement_records
     payload["modelized_facet_unit_writer"] = dict(unit_metadata or {})
+    ingest_text = f"[{timestamp}] user: {text}"
     adapter.ingest_turn(
-        f"[{timestamp}] user: {text}",
+        ingest_text,
         assistant_text="",
         answer_payload=payload,
         extraction_result={},
     )
-    return {
+    result = {
         "seconds": round(time.perf_counter() - t0, 3),
         "proposal_count": len(proposals or []),
         "accepted_count": int(getattr(gate_result, "accepted_count", 0) or 0),
@@ -454,6 +546,32 @@ def writer_ingest(adapter: Any, writer: Any, text: str, *, qid: str, chunk_id: s
         "unit_writer_enabled": bool(unit_metadata.get("enabled", False)),
         "unit_writer_metadata": dict(unit_metadata or {}),
     }
+    if cache_mode == "record":
+        if cache_path is None:
+            raise RuntimeError("TMCRA_WRITER_CACHE_MODE=record requires TMCRA_WRITER_CACHE_DIR")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "qid": qid,
+                    "chunk_id": chunk_id,
+                    "timestamp": timestamp,
+                    "text": text,
+                    "ingest_text": ingest_text,
+                    "payload": payload,
+                    "result": result,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        tmp_path.replace(cache_path)
+        result["writer_cache_mode"] = "record"
+        result["writer_cache_path"] = str(cache_path)
+    return result
 
 
 def retrieval_debug(retrieval: Any) -> dict[str, Any]:
@@ -594,6 +712,16 @@ def evidence_unit_planner_config() -> tuple[str, str, str]:
         clean_text(os.getenv("TMCRA_EVIDENCE_UNIT_PLANNER_BASE_URL", "")) or answer_base_url,
         clean_text(os.getenv("TMCRA_EVIDENCE_UNIT_PLANNER_MODEL", "")) or answer_model,
         clean_text(os.getenv("TMCRA_EVIDENCE_UNIT_PLANNER_API_KEY", "")) or answer_api_key,
+    )
+
+
+def llm_channel_planner_config() -> tuple[str, str, str]:
+    # TMCRA_LAYER_TAG: optional answer-side LLM channel planner config; not graph-memory model core.
+    answer_base_url, answer_model, answer_api_key = answer_llm_config()
+    return (
+        clean_text(os.getenv("TMCRA_LLM_CHANNEL_PLANNER_BASE_URL", "")) or answer_base_url,
+        clean_text(os.getenv("TMCRA_LLM_CHANNEL_PLANNER_MODEL", "")) or answer_model,
+        clean_text(os.getenv("TMCRA_LLM_CHANNEL_PLANNER_API_KEY", "")) or answer_api_key,
     )
 
 
@@ -1159,12 +1287,8 @@ def evidence_windows_for_hit(question: str, hit: Any, *, max_chars: int = 1800) 
                 end = min(len(value), pos + len(child_anchor) + half)
                 value = clean_text(value[start:end])
             elif child_value or child_source_span:
-                value = clean_text(value)
-            if child_value or child_source_span:
                 value = clean_text(
-                    f"[unit evidence] {child_source_span or child_value}"
-                    f"{' | unit_value=' + child_value if child_value and child_value != child_source_span else ''}\n"
-                    f"[parent evidence] {value}"
+                    f"[unit evidence] {child_source_span or child_value}\n[parent evidence] {value}"
                 )
     units = turn_units(value)
     if not units:
@@ -2461,213 +2585,18 @@ def final_answer_channel_intent(question: str) -> dict[str, bool]:
     }
 
 
-def _json_object_from_text(value: str) -> dict[str, Any]:
-    text = clean_text(value)
-    if not text:
-        return {}
-    try:
-        payload = json.loads(text)
-        return payload if isinstance(payload, dict) else {}
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        return {}
-    try:
-        payload = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def build_query_graph(question: str, question_date: str = "") -> dict[str, Any]:
-    mode = os.getenv("TMCRA_QUERY_GRAPH_BUILDER_MODE", "").strip().lower()
-    if mode in {"", "0", "false", "off", "no", "disabled", "none"}:
-        return {"enabled": False, "mode": mode or "off"}
-    base_url, model, api_key = query_graph_llm_config()
-    try:
-        max_tokens = max(240, int(os.getenv("TMCRA_QUERY_GRAPH_MAX_TOKENS", "700") or 700))
-    except (TypeError, ValueError):
-        max_tokens = 700
-    system = (
-        "You convert a user question into a compact retrieval query graph for a long-memory system. "
-        "Return JSON only. Do not answer the question. Build a general graph, not benchmark-specific logic."
-    )
-    user = {
-        "question": question,
-        "question_date": question_date,
-        "schema": {
-            "task_intent": "direct_fact | count | sum | compare | temporal | preference | multi_evidence | unknown",
-            "operation": "none | count_distinct | sum_numeric | compare_values | select_latest | select_current | timeline_order | infer_preference",
-            "required_units": [
-                {
-                    "unit_key": "short stable key",
-                    "role": "main_fact | coverage_fact | old_value | current_value | temporal_anchor | constraint | negative",
-                    "target_entity": "entity or topic to retrieve",
-                    "attribute": "amount/count/status/action/time/preference/etc",
-                    "expected_value_type": "money | count | date | duration | item | state | preference | text",
-                    "must_cover": True,
-                }
-            ],
-            "tunnel_needs": ["same_topic", "cross_session", "same_entity", "temporal_chain", "profile_bridge"],
-            "query_terms": ["terms that should retrieve memory units"],
-            "negative_terms": ["terms that should not dominate retrieval"],
-        },
-    }
-    try:
-        raw = chat_completion(
-            base_url,
-            model,
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
-            ],
-            max_tokens=max_tokens,
-            temperature=0.0,
-            api_key=api_key,
-        )
-        graph = _json_object_from_text(raw)
-        if not graph:
-            return {"enabled": True, "mode": mode, "error": "empty_or_invalid_json", "raw": truncate(raw, 600)}
-        graph["enabled"] = True
-        graph["mode"] = mode
-        graph["model"] = model
-        return graph
-    except Exception as exc:
-        return {"enabled": True, "mode": mode, "error": f"{exc.__class__.__name__}: {str(exc)[:240]}"}
-
-
-def query_graph_retrieval_text(question: str, question_date: str, query_graph: dict[str, Any]) -> str:
-    runtime_question = question
-    if question_date:
-        runtime_question = f"{question}\nQuestion date: {question_date}"
-    use_text_mode = os.getenv("TMCRA_QUERY_GRAPH_RETRIEVAL_TEXT_MODE", "").strip().lower() in {"1", "true", "on", "yes"}
-    if not use_text_mode or not bool(query_graph.get("enabled", False)) or query_graph.get("error"):
-        return runtime_question
-    graph = {key: value for key, value in query_graph.items() if key not in {"enabled", "mode", "model", "raw"}}
-    graph_text = truncate(json.dumps(graph, ensure_ascii=False), int(os.getenv("TMCRA_QUERY_GRAPH_RETRIEVAL_CHARS", "2200") or 2200))
-    return f"{runtime_question}\n\nQuestion retrieval graph JSON:\n{graph_text}"
-
-
-def query_graph_sidecar_queries(question: str, question_date: str, query_graph: dict[str, Any]) -> list[str]:
-    if not bool(query_graph.get("enabled", False)) or query_graph.get("error"):
-        return []
-    mode = os.getenv("TMCRA_QUERY_GRAPH_SIDECAR_RETRIEVAL_MODE", "on").strip().lower()
-    if mode in {"", "0", "false", "off", "no", "disabled", "none"}:
-        return []
-    try:
-        max_queries = max(0, int(os.getenv("TMCRA_QUERY_GRAPH_SIDECAR_MAX_QUERIES", "6") or 6))
-    except (TypeError, ValueError):
-        max_queries = 6
-    if max_queries <= 0:
-        return []
-    query_terms = [clean_text(item) for item in list(query_graph.get("query_terms") or []) if clean_text(item)]
-    required_units = list(query_graph.get("required_units") or [])
-    queries: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: str) -> None:
-        text = clean_text(value)
-        if not text:
-            return
-        if question_date and "question date:" not in text.lower():
-            text = f"{text}\nQuestion date: {question_date}"
-        key = text.lower()
-        if key in seen or len(queries) >= max_queries:
-            return
-        seen.add(key)
-        queries.append(text)
-
-    for unit in required_units:
-        if not isinstance(unit, dict):
-            continue
-        role = clean_text(unit.get("role", ""))
-        target = clean_text(unit.get("target_entity", ""))
-        attribute = clean_text(unit.get("attribute", ""))
-        value_type = clean_text(unit.get("expected_value_type", ""))
-        unit_key = clean_text(unit.get("unit_key", ""))
-        add(
-            " ".join(
-                part
-                for part in [
-                    question,
-                    f"required evidence role {role}",
-                    f"target {target}",
-                    f"attribute {attribute}",
-                    f"value type {value_type}",
-                    f"unit {unit_key}",
-                ]
-                if part
-            )
-        )
-    if query_terms and len(queries) < max_queries:
-        add(f"{question} {' '.join(query_terms[:24])}")
-    return queries[:max_queries]
-
-
-def merge_memory_hits(primary_hits: list[Any], extra_hits: list[Any]) -> list[Any]:
-    merged: list[Any] = []
-    seen: set[str] = set()
-    for hit in [*primary_hits, *extra_hits]:
-        memory_id = clean_text(getattr(hit, "memory_id", ""))
-        key = memory_id or clean_text(getattr(hit, "text", ""))[:240].lower()
-        if key and key in seen:
-            continue
-        if key:
-            seen.add(key)
-        merged.append(hit)
-    return merged
-
-
-def apply_query_graph_sidecar_retrieval(
-    adapter: Any,
-    query_graph: dict[str, Any],
-    question: str,
-    question_date: str,
-    hits: list[Any],
-    *,
-    top_k: int,
-) -> tuple[list[Any], dict[str, Any]]:
-    queries = query_graph_sidecar_queries(question, question_date, query_graph)
-    if not queries:
-        return hits, {"enabled": False, "reason": "no_queries"}
-    try:
-        per_query_top_k = max(1, int(os.getenv("TMCRA_QUERY_GRAPH_SIDECAR_TOP_K", "4") or 4))
-    except (TypeError, ValueError):
-        per_query_top_k = 4
-    extra_hits: list[Any] = []
-    errors: list[str] = []
-    for query in queries:
-        try:
-            retrieval = adapter.retrieve(query, top_k=min(max(1, top_k), per_query_top_k))
-            extra_hits.extend(list(getattr(retrieval, "hits", []) or []))
-        except Exception as exc:
-            errors.append(f"{exc.__class__.__name__}:{str(exc)[:160]}")
-    merged = merge_memory_hits(hits, extra_hits)
-    return merged, {
-        "enabled": True,
-        "query_count": len(queries),
-        "extra_hit_count": len(extra_hits),
-        "merged_hit_count": len(merged),
-        "errors": errors[:3],
-        "queries": [truncate(item, 260) for item in queries[:6]],
-    }
-
-
 def final_answer_surface_windows(question: str, evidence_windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     mode = os.getenv("TMCRA_FINAL_ANSWER_SURFACE_CHANNEL_MODE", "on").strip().lower()
     if mode in {"", "0", "false", "off", "no", "disabled", "none"} or not evidence_windows:
         return evidence_windows
-    intent = final_answer_channel_intent(question)
     try:
         final_limit = max(4, int(os.getenv("TMCRA_ANSWER_EVIDENCE_WINDOW_LIMIT", "8") or 8))
-        if intent["aggregation"]:
-            final_limit = max(final_limit, int(os.getenv("TMCRA_ANSWER_EVIDENCE_WINDOW_LIMIT_AGG", "12") or 12))
     except (TypeError, ValueError):
-        final_limit = 12 if final_answer_channel_intent(question)["aggregation"] else 8
+        final_limit = 8
+    intent = final_answer_channel_intent(question)
     if intent["aggregation"]:
-        main_hard_limit = max(4, int(os.getenv("TMCRA_FINAL_MAIN_HARD_LIMIT_AGG", "6") or 6))
-        coverage_hard_limit = max(1, int(os.getenv("TMCRA_FINAL_COVERAGE_HARD_LIMIT_AGG", "6") or 6))
+        main_hard_limit = max(3, int(os.getenv("TMCRA_FINAL_MAIN_HARD_LIMIT_AGG", "5") or 5))
+        coverage_hard_limit = max(1, int(os.getenv("TMCRA_FINAL_COVERAGE_HARD_LIMIT_AGG", "3") or 3))
     elif intent["temporal"] or intent["assistant_detail"]:
         main_hard_limit = max(4, int(os.getenv("TMCRA_FINAL_MAIN_HARD_LIMIT_DETAIL", "7") or 7))
         coverage_hard_limit = max(0, int(os.getenv("TMCRA_FINAL_COVERAGE_HARD_LIMIT_DETAIL", "1") or 1))
@@ -2703,9 +2632,8 @@ def final_answer_surface_windows(question: str, evidence_windows: list[dict[str,
 
     assistant_candidates = [item for item in evidence_windows if is_assistant_candidate(item)]
     assistant = [item for item in evidence_windows if is_assistant(item)]
-    source_windows = list(evidence_windows)
-    main = [item for item in source_windows if not is_coverage(item) and not is_assistant(item) and not is_assistant_candidate(item)]
-    coverage = [item for item in source_windows if is_coverage(item)]
+    main = [item for item in evidence_windows if not is_coverage(item) and not is_assistant(item) and not is_assistant_candidate(item)]
+    coverage = [item for item in evidence_windows if is_coverage(item)]
     assistant_candidates.sort(key=key, reverse=True)
     assistant.sort(key=key, reverse=True)
     main.sort(key=key, reverse=True)
@@ -2833,6 +2761,8 @@ def apply_llm_channel_planner(question: str, evidence_windows: list[dict[str, An
         "Rules:\n"
         "- main_indices must keep direct facts, stable base evidence, temporal anchors, assistant details, and profile facts.\n"
         "- coverage_indices are for count, sum, ratio, duration, repeated actions, multi-unit coverage, or unit-to-unit chains.\n"
+        "- coverage_indices must be evidence-backed units about the user's actual stated actions, quantities, states, or commitments.\n"
+        "- Generic assistant advice, examples, defaults, or hypothetical recommendations must not be coverage unless the user explicitly adopted or confirmed them.\n"
         "- coverage evidence supplements main evidence; do not let coverage replace main facts.\n"
         "- support_indices are useful context only.\n"
         "- suppress_indices are duplicates, stale/conflicting values, or noise.\n"
@@ -2847,7 +2777,7 @@ def apply_llm_channel_planner(question: str, evidence_windows: list[dict[str, An
         + "\n\n".join(lines)
     )
     try:
-        base_url, model, api_key = answer_llm_config()
+        base_url, model, api_key = llm_channel_planner_config()
         raw = chat_completion(
             base_url,
             model,
@@ -2991,6 +2921,28 @@ def complete_profile_answer_from_evidence(
     return answer
 
 
+def is_chain_evidence_slot(item: dict[str, Any]) -> bool:
+    return bool(item.get("chain_evidence_organizer_slot", False)) or clean_text(item.get("evidence_channel", "")) == "chain_summary"
+
+
+def is_strong_chain_evidence_slot(item: dict[str, Any]) -> bool:
+    if not is_chain_evidence_slot(item):
+        return False
+    sufficiency = clean_text(item.get("chain_evidence_sufficiency", "")).lower()
+    candidate_answer = clean_text(item.get("chain_evidence_candidate_answer", ""))
+    if not sufficiency or not candidate_answer:
+        text = clean_text(item.get("text", ""))
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            try:
+                payload = json.loads(match.group(0))
+                sufficiency = sufficiency or clean_text(payload.get("evidence_sufficiency", "")).lower()
+                candidate_answer = candidate_answer or clean_text(payload.get("candidate_answer", ""))
+            except Exception:
+                pass
+    return sufficiency == "sufficient" and bool(candidate_answer)
+
+
 def answer_question(question: str, memory_hits: list[Any], evidence_windows: list[dict[str, Any]] | None = None) -> str:
     if evidence_windows is None:
         evidence_windows = build_answer_evidence(question, memory_hits)
@@ -3031,13 +2983,10 @@ def answer_question(question: str, memory_hits: list[Any], evidence_windows: lis
     compact_hit_lines = compact_memory_hit_lines(memory_hits)
     memory_lines = []
     evidence_window_limit = int(os.getenv("TMCRA_ANSWER_EVIDENCE_WINDOW_LIMIT", "8"))
-    if final_answer_channel_intent(question)["aggregation"]:
-        evidence_window_limit = max(
-            evidence_window_limit,
-            int(os.getenv("TMCRA_ANSWER_EVIDENCE_WINDOW_LIMIT_AGG", "12") or 12),
-        )
     ranked_evidence_windows = list(evidence_windows[: max(1, evidence_window_limit)])
     for index, item in enumerate(ranked_evidence_windows, start=1):
+        if is_chain_evidence_slot(item):
+            continue
         value = clean_text(item.get("text", ""))
         if value:
             memory_id = clean_text(item.get("memory_id", ""))
@@ -3058,6 +3007,7 @@ def answer_question(question: str, memory_hits: list[Any], evidence_windows: lis
     model_plan_has_temporal_units = False
     model_plan_has_computed_temporal_answer = False
     model_plan_has_computed_coverage_answer = False
+    model_plan_has_chain_evidence = False
     seen_model_plan_ids: set[str] = set()
     for item in evidence_windows:
         if not (
@@ -3066,6 +3016,7 @@ def answer_question(question: str, memory_hits: list[Any], evidence_windows: lis
             or bool(item.get("operation_planner", False))
             or bool(item.get("unified_operation_planner", False))
             or bool(item.get("temporal_operation_layer", False))
+            or is_strong_chain_evidence_slot(item)
         ):
             continue
         value = clean_text(item.get("text", ""))
@@ -3081,6 +3032,8 @@ def answer_question(question: str, memory_hits: list[Any], evidence_windows: lis
             model_plan_has_computed_temporal_answer = True
         if re.search(r'"computed_coverage_answer":\{"answer":"[^"]+', value):
             model_plan_has_computed_coverage_answer = True
+        if is_strong_chain_evidence_slot(item):
+            model_plan_has_chain_evidence = True
         model_plan_lines.append(f"- [{memory_id}] {value}")
         if len(model_plan_lines) >= 3:
             break
@@ -3115,6 +3068,7 @@ def answer_question(question: str, memory_hits: list[Any], evidence_windows: lis
         "If focused evidence units are provided, scan them before the raw windows; they are compressed excerpts from retrieved memory, not external facts. "
         "If the evidence-unit plan lists answer_unit, positive_evidence, current_value, old_value, temporal_anchor, or negative_evidence units, reason over those units explicitly before deciding the answer. "
         "If an aggregation/unit coverage plan contains computed_coverage_answer.answer and its listed units_used or terms match the question, use that computed value unless raw evidence directly contradicts it. "
+        "If a TMCRA chain evidence slot is provided, read it as a chain-specific model plan before raw evidence. When evidence_sufficiency is sufficient and candidate_answer is present, use that candidate_answer unless the listed evidence units are contradicted by raw evidence. When evidence_sufficiency is partial or insufficient, use the listed units and missing_roles to decide whether direct evidence can still support an answer; do not treat a partial chain slot as a complete total. "
         "If candidate_answer is present in the plan and is supported by the listed units, prefer it over re-summarizing the raw window text. "
         "Before writing the JSON answer, internally infer the question task: direct fact lookup, arithmetic, distinct-item counting, temporal difference, current-value selection, preference/recommendation synthesis, or multi-evidence synthesis. "
         "Then use the retrieved evidence as clues for that task. "
@@ -3144,6 +3098,14 @@ def answer_question(question: str, memory_hits: list[Any], evidence_windows: lis
             "For count, total, sum, and arithmetic questions, prefer the computed answer when the listed units_used or terms are relevant evidence for the requested unit. "
             "Do not drop a listed unit merely because its raw evidence window also contains unrelated topic text. "
         )
+    chain_plan_protocol = ""
+    if model_plan_has_chain_evidence:
+        chain_plan_protocol = (
+            "When a TMCRA chain evidence slot is present in Model planner outputs, it is the normalized chain-evidence view for this question. "
+            "Use it to bind distinct units, temporal roles, and calculation direction before scanning raw evidence. "
+            "If the chain slot says evidence_sufficiency=sufficient and gives a candidate_answer, answer with that candidate unless raw evidence directly contradicts the listed units. "
+            "If a chain slot is partial or insufficient, do not invent missing units; combine only the listed units that raw evidence supports. "
+        )
     personalized_instruction = ""
     if personalized_request:
         personalized_instruction = (
@@ -3166,6 +3128,7 @@ def answer_question(question: str, memory_hits: list[Any], evidence_windows: lis
         + reasoning_protocol
         + temporal_plan_protocol
         + coverage_plan_protocol
+        + chain_plan_protocol
         + "If the question has multiple parts, compares earlier versus now, or asks for both before/current values, answer every requested part explicitly. "
         "If evidence lines are tagged with role=initial_value and role=current_value, use initial_value for the earlier/starting state and current_value for the now/current state; do not collapse them into one value. "
         "For current or now values, prefer later-dated evidence over earlier evidence when both are present. "
@@ -3597,21 +3560,64 @@ def run(args: argparse.Namespace) -> None:
                     chunk_errors.append(f"{chunk_id}:{exc.__class__.__name__}:{str(exc)[:200]}")
                     log("chunk_error", sample=sample_index, qid=qid, chunk=chunk_id, error=str(exc)[:240])
 
+        if getattr(args, "write_only", False):
+            graph = getattr(adapter, "graph", None)
+            record = {
+                "sample_index": sample_index,
+                "question_id": qid,
+                "question_type": row.get("question_type"),
+                "question": question,
+                "question_date": clean_text(row.get("question_date", "")),
+                "gold_answer": gold,
+                "hypothesis": "",
+                "answer_session_ids": list(row.get("answer_session_ids") or []),
+                "selected_session_ids": selected_session_ids,
+                "total_sessions": len(sessions),
+                "total_turns": sum(len(s or []) for s in sessions),
+                "selected_sessions": len(selected_session_ids),
+                "history_mode": "official_full_history" if args.official_full_history else "controlled_answer_plus_distractors",
+                "write_only": True,
+                "writer_calls": writer_calls,
+                "writer_accepted": writer_accepted,
+                "writer_suspected": writer_suspected,
+                "writer_records": writer_records,
+                "writer_unit_records": writer_unit_records,
+                "writer_unit_calls": writer_unit_calls,
+                "writer_seconds": round(writer_seconds, 3),
+                "retrieve_seconds_wall": 0.0,
+                "answer_seconds": 0.0,
+                "sample_seconds": round(time.perf_counter() - sample_start, 3),
+                "graph_records": len(getattr(graph, "records_by_id", {}) or {}),
+                "graph_edges": len(getattr(graph, "edges", []) or []),
+                "chunk_errors": chunk_errors,
+                "retrieval": {"hit_count": 0, "selected_event_count": 0, "selected_path_count": 0, "hits": []},
+                "evidence_unit_plan": {},
+                "answer_evidence_windows": [],
+            }
+            records.append(record)
+            with predictions_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"question_id": qid, "hypothesis": ""}, ensure_ascii=False) + "\n")
+            with debug_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            log(
+                "sample_write_only_done",
+                sample=sample_index,
+                qid=qid,
+                writer_calls=writer_calls,
+                graph_records=record["graph_records"],
+                graph_edges=record["graph_edges"],
+                seconds=record["sample_seconds"],
+            )
+            continue
+
         question_date = clean_text(row.get("question_date", ""))
-        query_graph = build_query_graph(question, question_date)
-        runtime_question = query_graph_retrieval_text(question, question_date, query_graph)
+        runtime_question = question
+        if question_date:
+            runtime_question = f"{question}\nQuestion date: {question_date}"
         retrieve_start = time.perf_counter()
         retrieval = adapter.retrieve(runtime_question, top_k=args.top_k)
         retrieve_seconds = time.perf_counter() - retrieve_start
         hits = list(getattr(retrieval, "hits", []) or [])
-        hits, query_graph_sidecar = apply_query_graph_sidecar_retrieval(
-            adapter,
-            query_graph,
-            question,
-            question_date,
-            hits,
-            top_k=args.top_k,
-        )
         hits = expand_dialogue_chain_hits(runtime_question, hits, getattr(adapter, "graph", None))
         hits = expand_semantic_coverage_hits(runtime_question, hits, getattr(adapter, "graph", None))
         answer_evidence_windows = build_answer_evidence(runtime_question, hits)
@@ -3632,8 +3638,6 @@ def run(args: argparse.Namespace) -> None:
             "question_type": row.get("question_type"),
             "question": question,
             "question_date": question_date,
-            "query_graph": query_graph,
-            "query_graph_sidecar": query_graph_sidecar,
             "gold_answer": gold,
             "hypothesis": hypothesis,
             "answer_session_ids": list(row.get("answer_session_ids") or []),
@@ -3784,6 +3788,7 @@ def main() -> None:
     parser.add_argument("--max-session-chunks", type=int, default=0)
     parser.add_argument("--chunk-chars", type=int, default=7000)
     parser.add_argument("--enable-topic-buckets", action="store_true")
+    parser.add_argument("--write-only", action="store_true", help="Ingest/write graph only; skip retrieval, answer generation, and answer-side LLM calls.")
     args = parser.parse_args()
     run(args)
 

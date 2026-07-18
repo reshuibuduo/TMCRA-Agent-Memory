@@ -1,0 +1,22 @@
+[
+  {
+    "question_id": "tmcra_fixture_user",
+    "question_type": "single-session-user",
+    "question": "Which drink did the user choose?",
+    "answer": "Tea.",
+    "question_date": "2026-01-02",
+    "haystack_session_ids": ["fixture-session-1"],
+    "haystack_dates": ["2026-01-01"],
+    "haystack_sessions": [[{"role": "user", "content": "I chose tea."}]]
+  },
+  {
+    "question_id": "tmcra_fixture_update",
+    "question_type": "knowledge-update",
+    "question": "Where does the user live now?",
+    "answer": "Shanghai.",
+    "question_date": "2026-01-03",
+    "haystack_session_ids": ["fixture-session-2"],
+    "haystack_dates": ["2026-01-02"],
+    "haystack_sessions": [[{"role": "user", "content": "I moved from Suzhou to Shanghai."}]]
+  }
+]

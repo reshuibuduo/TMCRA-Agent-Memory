@@ -3,3 +3,27 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.pid
+
+# Local environments and provider credentials
+.env
+.env.*
+*.env
+!*.env.example
+*.key
+*.pem
+
+# Generated benchmark/runtime data
+.pytest_cache/
+.venv/
+runs/
+data/
+artifacts/
+*.part
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Downloaded third-party model snapshots. TMCRA's tracked release weights
+# remain under models/ and are explicitly staged through Git LFS.
+**/models/BAAI/

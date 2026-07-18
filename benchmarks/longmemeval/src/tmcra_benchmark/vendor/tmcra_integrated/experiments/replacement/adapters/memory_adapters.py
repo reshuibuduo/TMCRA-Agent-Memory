@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import functools
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
@@ -96,6 +101,16 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return float(default)
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = _clean_text(os.getenv(name, ""))
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
 
 
 _GRAPH_PROMPT_MAX_CHARS = 12_000
@@ -470,17 +485,767 @@ def _bounded_event_id_union(*groups: Iterable[Any], max_items: int) -> List[str]
     return _dedupe((item for group in groups for item in group), max_items=max(1, int(max_items)))
 
 
-def _symbolic_recall_event_ids(
-    query: str,
+_DEEPSEEK_GRAPH_TEACHER_EXAMPLE_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _deepseek_graph_teacher_mode() -> str:
+    mode = _normalize(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_MODE", "off"))
+    if mode in {"1", "true", "yes", "on", "replace", "teacher"}:
+        return "replace"
+    if mode in {"shadow", "observe", "observer", "telemetry"}:
+        return "shadow"
+    if mode in {"fusion", "fuse", "merge"}:
+        return "fusion"
+    return "off"
+
+
+def _deepseek_graph_teacher_api_key() -> str:
+    explicit = _clean_text(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_API_KEY", ""))
+    if explicit:
+        return explicit
+    for name in (
+        "TMCRA_DEEPSEEK_GRAPH_MODEL_KEY",
+        "DEEPSEEK_API_KEY",
+        "TMCRA_WRITER_API_KEY",
+        "OPENAI_API_KEY",
+    ):
+        value = _clean_text(os.getenv(name, ""))
+        if value:
+            return value
+    pool = os.getenv("TMCRA_DEEPSEEK_WRITER_KEY_POOL", "")
+    for part in re.split(r"[\s,;]+", pool):
+        value = _clean_text(part)
+        if value:
+            return value
+    return ""
+
+
+def _deepseek_graph_teacher_extract_json(text: Any) -> Dict[str, Any]:
+    payload = _clean_text(text)
+    if not payload:
+        return {}
+    try:
+        parsed = json.loads(payload)
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    start = payload.find("{")
+    end = payload.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(payload[start : end + 1])
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _deepseek_graph_teacher_score(value: Any, default: float = 0.0) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        score = float(default)
+    if math.isnan(score) or math.isinf(score):
+        score = float(default)
+    return max(0.0, min(1.0, float(score)))
+
+
+def _deepseek_graph_teacher_score_map(raw: Any, valid_ids: set[str]) -> Dict[str, float]:
+    if not isinstance(raw, Mapping):
+        return {}
+    scores: Dict[str, float] = {}
+    for raw_id, raw_score in raw.items():
+        item_id = _clean_text(raw_id)
+        if not item_id or item_id not in valid_ids:
+            continue
+        scores[item_id] = _deepseek_graph_teacher_score(raw_score)
+    return scores
+
+
+def _deepseek_graph_teacher_id_list(raw: Any, valid_ids: set[str], *, max_items: int) -> List[str]:
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
+        return []
+    return _dedupe(
+        (_clean_text(item) for item in raw if _clean_text(item) in valid_ids),
+        max_items=max(1, int(max_items)),
+    )
+
+
+def _deepseek_graph_teacher_ranked_ids(scores: Mapping[str, float], *, max_items: int) -> List[str]:
+    return [
+        item_id
+        for item_id, _ in sorted(
+            ((item_id, float(score)) for item_id, score in scores.items() if _clean_text(item_id)),
+            key=lambda item: (-float(item[1]), item[0]),
+        )
+    ][: max(1, int(max_items))]
+
+
+def _deepseek_graph_teacher_compact_graph(
+    runtime_graph: Mapping[str, Any],
+    candidate_event_ids: Sequence[str],
+    *,
+    max_events: int,
+    max_paths: int,
+) -> Dict[str, Any]:
+    event_candidates = _dedupe(candidate_event_ids, max_items=max(1, int(max_events)))
+    event_candidate_set = set(event_candidates)
+    event_nodes: List[Dict[str, Any]] = []
+    for node in list(runtime_graph.get("nodes", []) or []):
+        if _clean_text(node.get("type", "")) != "event":
+            continue
+        event_id = _clean_text(node.get("id", ""))
+        if event_candidate_set and event_id not in event_candidate_set:
+            continue
+        metadata = dict(node.get("metadata", {}) or {})
+        event_nodes.append(
+            {
+                "id": event_id,
+                "text": _clean_text(node.get("text", ""))[:700],
+                "speaker": _clean_text(node.get("speaker", "")),
+                "turn_index": int(node.get("turn_index", 0) or 0),
+                "session_name": _clean_text(node.get("session_name", "")),
+                "slot_key": _clean_text(node.get("slot_key", "")),
+                "state_signature": _clean_text(node.get("state_signature", "")),
+                "target_status": _clean_text(node.get("target_status", "")),
+                "time_value": _clean_text(node.get("time_value", "")),
+                "time_display_value": _clean_text(node.get("time_display_value", "")),
+                "profile_type": _clean_text(node.get("profile_type", "")),
+                "profile_value": _clean_text(node.get("profile_value", ""))[:300],
+                "subject_signature": _clean_text(node.get("subject_signature", "")),
+                "tunnel_roles": list(node.get("tmcra_tunnel_roles", []) or [])[:8],
+                "tunnel_group_key": _clean_text(node.get("tmcra_tunnel_group_key", "")),
+                "teacher_fields": dict(node.get("teacher_fields", {}) or {}),
+                "metadata_tags": {
+                    "source_kind": _clean_text(metadata.get("source_kind", "")),
+                    "semantic_slot": _clean_text(metadata.get("semantic_slot", "")),
+                    "event_signature": _clean_text(metadata.get("event_signature", ""))[:240],
+                },
+            }
+        )
+    if not event_nodes:
+        for node in list(runtime_graph.get("nodes", []) or []):
+            if _clean_text(node.get("type", "")) == "event":
+                event_id = _clean_text(node.get("id", ""))
+                if event_id:
+                    event_nodes.append({"id": event_id, "text": _clean_text(node.get("text", ""))[:700]})
+                if len(event_nodes) >= max(1, int(max_events)):
+                    break
+    compact_event_ids = {_clean_text(node.get("id", "")) for node in event_nodes if _clean_text(node.get("id", ""))}
+    path_rows: List[Dict[str, Any]] = []
+    for path in list(runtime_graph.get("paths", []) or []):
+        path_id = _clean_text(path.get("id", ""))
+        event_id = _clean_text(path.get("event_id", ""))
+        if not path_id or (compact_event_ids and event_id not in compact_event_ids):
+            continue
+        path_rows.append(
+            {
+                "id": path_id,
+                "event_id": event_id,
+                "type": _clean_text(path.get("type", "")),
+                "text": _clean_text(path.get("text", ""))[:700],
+                "support_node_ids": list(path.get("support_node_ids", []) or [])[:8],
+                "tags": list(path.get("tags", []) or [])[:8],
+            }
+        )
+        if len(path_rows) >= max(1, int(max_paths)):
+            break
+    tunnel_rows: List[Dict[str, Any]] = []
+    for edge in list(runtime_graph.get("typed_tunnel_edges", []) or []):
+        source = _clean_text(edge.get("source", edge.get("from", "")))
+        target = _clean_text(edge.get("target", edge.get("to", "")))
+        if compact_event_ids and source not in compact_event_ids and target not in compact_event_ids:
+            continue
+        tunnel_rows.append(
+            {
+                "source": source,
+                "target": target,
+                "type": _clean_text(edge.get("type", edge.get("relation", ""))),
+                "roles": list(edge.get("roles", []) or [])[:8],
+                "score": edge.get("score", edge.get("weight", 0.0)),
+            }
+        )
+        if len(tunnel_rows) >= max(1, int(max_paths)):
+            break
+    return {
+        "events": event_nodes,
+        "paths": path_rows,
+        "typed_tunnel_edges": tunnel_rows,
+    }
+
+
+def _deepseek_graph_teacher_examples() -> List[Dict[str, Any]]:
+    path = _clean_text(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_EXAMPLES_JSONL", ""))
+    if not path:
+        return []
+    limit = max(0, _int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_EXAMPLE_LIMIT", 4))
+    if limit <= 0:
+        return []
+    cache_key = f"{path}|{limit}"
+    if cache_key in _DEEPSEEK_GRAPH_TEACHER_EXAMPLE_CACHE:
+        return list(_DEEPSEEK_GRAPH_TEACHER_EXAMPLE_CACHE[cache_key])
+    examples: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if len(examples) >= limit:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, Mapping):
+                    continue
+                question = _clean_text(row.get("question", row.get("query", "")))
+                output = row.get("output", row.get("target", row.get("teacher_output", {})))
+                if not question or not isinstance(output, Mapping):
+                    continue
+                compact = {
+                    "question": question[:500],
+                    "gold": {
+                        "selected_event_ids": list(output.get("selected_event_ids", row.get("selected_event_ids", [])) or [])[:8],
+                        "selected_path_ids": list(output.get("selected_path_ids", row.get("selected_path_ids", [])) or [])[:8],
+                        "focused_answer_type": _clean_text(output.get("focused_answer_type", row.get("focused_answer_type", ""))),
+                    },
+                }
+                positive_event_ids = list(row.get("positive_event_ids", row.get("target_event_ids", [])) or [])[:8]
+                positive_path_ids = list(row.get("positive_path_ids", row.get("target_path_ids", [])) or [])[:8]
+                if positive_event_ids:
+                    compact["gold"]["positive_event_ids"] = positive_event_ids
+                if positive_path_ids:
+                    compact["gold"]["positive_path_ids"] = positive_path_ids
+                examples.append(compact)
+    except OSError:
+        examples = []
+    _DEEPSEEK_GRAPH_TEACHER_EXAMPLE_CACHE[cache_key] = list(examples)
+    return examples
+
+
+def _deepseek_graph_teacher_normalize_output(
+    raw: Mapping[str, Any],
+    runtime_graph: Mapping[str, Any],
+    *,
+    mode: str,
+    model: str,
+    usage: Mapping[str, Any] | None,
+    elapsed_ms: int,
+    candidate_event_ids: Sequence[str],
+    top_k: int,
+    support_path_k: int,
+) -> Dict[str, Any]:
+    valid_event_ids = {
+        _clean_text(node.get("id", ""))
+        for node in list(runtime_graph.get("nodes", []) or [])
+        if _clean_text(node.get("type", "")) == "event" and _clean_text(node.get("id", ""))
+    }
+    valid_path_ids = {
+        _clean_text(path.get("id", ""))
+        for path in list(runtime_graph.get("paths", []) or [])
+        if _clean_text(path.get("id", ""))
+    }
+    event_scores = _deepseek_graph_teacher_score_map(raw.get("event_scores", {}), valid_event_ids)
+    path_scores = _deepseek_graph_teacher_score_map(raw.get("path_scores", {}), valid_path_ids)
+    selected_event_ids = _deepseek_graph_teacher_id_list(
+        raw.get("selected_event_ids", []),
+        valid_event_ids,
+        max_items=max(top_k, support_path_k * 2, _HYBRID_SELECTED_EVENT_FLOOR),
+    )
+    recall_event_ids = _deepseek_graph_teacher_id_list(
+        raw.get("recall_event_ids", []),
+        valid_event_ids,
+        max_items=max(_int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_RECALL_EVENT_K", 24), len(selected_event_ids), top_k),
+    )
+    selected_path_ids = _deepseek_graph_teacher_id_list(
+        raw.get("selected_path_ids", []),
+        valid_path_ids,
+        max_items=max(1, support_path_k),
+    )
+    for rank, event_id in enumerate(selected_event_ids, start=1):
+        event_scores[event_id] = max(float(event_scores.get(event_id, 0.0)), max(0.68, 1.0 - (rank - 1) * 0.035))
+    if not selected_event_ids:
+        selected_event_ids = _deepseek_graph_teacher_ranked_ids(
+            event_scores,
+            max_items=max(top_k, support_path_k * 2, _HYBRID_SELECTED_EVENT_FLOOR),
+        )
+    if not recall_event_ids:
+        recall_event_ids = _bounded_event_id_union(
+            selected_event_ids,
+            _deepseek_graph_teacher_ranked_ids(event_scores, max_items=max(24, len(candidate_event_ids))),
+            candidate_event_ids,
+            max_items=max(24, len(candidate_event_ids), top_k),
+        )
+    for rank, event_id in enumerate(recall_event_ids, start=1):
+        event_scores[event_id] = max(float(event_scores.get(event_id, 0.0)), max(0.30, 0.84 - (rank - 1) * 0.015))
+    for rank, path_id in enumerate(selected_path_ids, start=1):
+        path_scores[path_id] = max(float(path_scores.get(path_id, 0.0)), max(0.64, 1.0 - (rank - 1) * 0.05))
+    if not selected_path_ids:
+        selected_path_ids = _deepseek_graph_teacher_ranked_ids(path_scores, max_items=max(1, support_path_k))
+    if not path_scores and selected_event_ids:
+        for path in list(runtime_graph.get("paths", []) or []):
+            path_id = _clean_text(path.get("id", ""))
+            event_id = _clean_text(path.get("event_id", ""))
+            if path_id and event_id in set(selected_event_ids):
+                path_scores[path_id] = max(0.40, float(event_scores.get(event_id, 0.5)))
+    raw_plan = raw.get("answer_plan_scores", {})
+    answer_plan_scores: Dict[str, Dict[str, float]] = {}
+    if isinstance(raw_plan, Mapping):
+        for role in ("selected", "current", "historical", "suppressed"):
+            answer_plan_scores[role] = _deepseek_graph_teacher_score_map(raw_plan.get(role, {}), valid_event_ids)
+    for role in ("selected", "current", "historical", "suppressed"):
+        answer_plan_scores.setdefault(role, {})
+    for event_id in selected_event_ids:
+        score = max(float(event_scores.get(event_id, 0.0)), 0.62)
+        answer_plan_scores["selected"][event_id] = max(float(answer_plan_scores["selected"].get(event_id, 0.0)), score)
+        answer_plan_scores["current"][event_id] = max(float(answer_plan_scores["current"].get(event_id, 0.0)), min(1.0, score * 0.92))
+    answer_type_scores = {
+        key: _deepseek_graph_teacher_score(value)
+        for key, value in dict(raw.get("answer_type_scores", {}) or {}).items()
+        if _clean_text(key)
+    }
+    if not answer_type_scores:
+        answer_type_scores = {"multi_evidence": 0.55, "direct_fact": 0.45}
+    memory_router_scores = _deepseek_graph_teacher_score_map(raw.get("memory_router_scores", {}), set(MEMORY_ROUTER_LAYERS))
+    if not memory_router_scores:
+        focused_type = _normalize(raw.get("focused_answer_type", ""))
+        memory_router_scores = {layer: 0.35 for layer in MEMORY_ROUTER_LAYERS}
+        memory_router_scores["event"] = 0.75
+        if focused_type in {"time", "temporal", "temporal_reasoning"}:
+            memory_router_scores["temporal"] = 0.78
+        if focused_type in {"profile", "preference", "resource"}:
+            memory_router_scores["profile"] = 0.78
+            memory_router_scores["resource"] = 0.68
+        if focused_type in {"multi", "multi_evidence", "aggregation", "chain"}:
+            memory_router_scores["path_tunnel"] = 0.72
+            memory_router_scores["topic_tunnel"] = 0.62
+    path_tunnel_support_scores = _deepseek_graph_teacher_score_map(raw.get("path_tunnel_support_scores", {}), valid_path_ids)
+    path_tunnel_delta_scores = _deepseek_graph_teacher_score_map(raw.get("path_tunnel_delta_scores", {}), valid_path_ids)
+    event_tunnel_support_scores = _deepseek_graph_teacher_score_map(raw.get("event_tunnel_support_scores", {}), valid_event_ids)
+    event_tunnel_delta_scores = _deepseek_graph_teacher_score_map(raw.get("event_tunnel_delta_scores", {}), valid_event_ids)
+    focused_answer_type = _clean_text(raw.get("focused_answer_type", "")) or max(
+        answer_type_scores.items(),
+        key=lambda item: (float(item[1]), item[0]),
+    )[0]
+    metadata = {
+        "mode": mode,
+        "status": "ok",
+        "model": model,
+        "elapsed_ms": int(elapsed_ms),
+        "selected_event_count": int(len(selected_event_ids)),
+        "selected_path_count": int(len(selected_path_ids)),
+        "usage": {
+            "prompt_tokens": int(dict(usage or {}).get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(dict(usage or {}).get("completion_tokens", 0) or 0),
+            "total_tokens": int(dict(usage or {}).get("total_tokens", 0) or 0),
+        },
+        "reason": _clean_text(raw.get("reason", ""))[:500],
+    }
+    return {
+        "recall_event_ids": list(recall_event_ids),
+        "rerank_candidate_event_ids": list(recall_event_ids),
+        "selected_event_ids": list(selected_event_ids),
+        "selected_path_ids": list(selected_path_ids),
+        "recall_event_scores": dict(event_scores),
+        "base_event_scores": dict(event_scores),
+        "rerank_event_scores": dict(event_scores),
+        "calibrated_event_scores": dict(event_scores),
+        "matrix_event_scores": dict(event_scores),
+        "event_scores": dict(event_scores),
+        "event_fusion_delta_scores": {},
+        "event_tunnel_support_scores": dict(event_tunnel_support_scores),
+        "event_tunnel_delta_scores": dict(event_tunnel_delta_scores),
+        "base_path_scores": dict(path_scores),
+        "calibrated_path_scores": dict(path_scores),
+        "rerank_path_scores": dict(path_scores),
+        "matrix_path_scores": dict(path_scores),
+        "path_model_scores": dict(path_scores),
+        "path_scores": dict(path_scores),
+        "path_fusion_delta_scores": {},
+        "path_tunnel_support_scores": dict(path_tunnel_support_scores),
+        "path_tunnel_delta_scores": dict(path_tunnel_delta_scores),
+        "answer_plan_scores": dict(answer_plan_scores),
+        "answer_type_scores": dict(answer_type_scores),
+        "focused_answer_type": focused_answer_type,
+        "memory_router_scores": dict(memory_router_scores),
+        "fusion_enabled": True,
+        "event_fusion_enabled": True,
+        "path_fusion_enabled": True,
+        "event_calibration_enabled": True,
+        "path_calibration_enabled": True,
+        "event_tunnel_enabled": bool(event_tunnel_support_scores or event_tunnel_delta_scores),
+        "path_tunnel_enabled": bool(path_tunnel_support_scores or path_tunnel_delta_scores or selected_path_ids),
+        "final_event_fusion_enabled": True,
+        "final_path_fusion_enabled": True,
+        "decision_fusion_enabled": True,
+        "decision_score_source": "deepseek_graph_teacher",
+        "matrix_enabled": False,
+        "matrix_path_enabled": False,
+        "path_chain_extension_enabled": False,
+        "deepseek_graph_model": metadata,
+    }
+
+
+def _deepseek_graph_teacher_call(
+    runtime_graph: Mapping[str, Any],
+    question: str,
+    *,
+    candidate_event_ids: Sequence[str],
+    top_k: int,
+    support_path_k: int,
+    local_scored: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    mode = _deepseek_graph_teacher_mode()
+    if mode == "off":
+        return {}
+    api_key = _deepseek_graph_teacher_api_key()
+    base_url = _clean_text(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_BASE_URL", "https://api.deepseek.com/v1")).rstrip("/")
+    model = _clean_text(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_MODEL", os.getenv("TMCRA_WRITER_MODEL", "deepseek-chat")))
+    if not api_key or not base_url or not model:
+        return {
+            "deepseek_graph_model": {
+                "mode": mode,
+                "status": "skipped_missing_config",
+                "model": model,
+            }
+        }
+    max_events = max(4, _int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_MAX_EVENTS", 28))
+    max_paths = max(4, _int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_MAX_PATHS", 64))
+    compact_graph = _deepseek_graph_teacher_compact_graph(
+        runtime_graph,
+        candidate_event_ids,
+        max_events=max_events,
+        max_paths=max_paths,
+    )
+    recall_limit = max(8, min(24, _int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_RECALL_EVENT_K", 24)))
+    selected_event_limit = max(top_k, support_path_k * 2, _HYBRID_SELECTED_EVENT_FLOOR)
+    selected_path_limit = max(1, support_path_k)
+    prompt_payload = {
+        "task": "score_runtime_graph",
+        "question": _clean_text(question),
+        "graph": compact_graph,
+        "local_model_hints": {
+            "recall_event_ids": list(dict(local_scored or {}).get("recall_event_ids", []) or [])[:16],
+            "selected_event_ids": list(dict(local_scored or {}).get("selected_event_ids", []) or [])[:12],
+            "selected_path_ids": list(dict(local_scored or {}).get("selected_path_ids", []) or [])[:8],
+            "focused_answer_type": _clean_text(dict(local_scored or {}).get("focused_answer_type", "")),
+        },
+        "few_shot_training_examples": _deepseek_graph_teacher_examples(),
+        "output_contract": {
+            "format": "one compact JSON object only; no markdown; no code fence; no explanation outside JSON",
+            "purpose": "rank evidence ids for the graph runtime; do not answer the user question",
+            "limits": {
+                "recall_event_ids": recall_limit,
+                "selected_event_ids": selected_event_limit,
+                "selected_path_ids": selected_path_limit,
+                "reason_chars": 180,
+            },
+            "important": [
+                "Do not emit full event_scores or full path_scores maps.",
+                "Score maps are optional and must be sparse: only include ids that appear in selected_event_ids or selected_path_ids.",
+                "Prefer ranked id arrays over verbose per-id scoring.",
+                "For direct-fact questions, choose a compact evidence-covering set.",
+                "For counting, listing, aggregation, or multi-evidence questions, selected_event_ids must cover all distinct answer-unit events within the limit; do not collapse separate instances into one semantic cluster.",
+                "For counting, listing, aggregation, or multi-evidence questions, recall_event_ids should include plausible borderline positive events before distractors so later evidence packing can preserve coverage.",
+                "Prefer one representative event per distinct answer unit before adding duplicate turns from the same unit.",
+            ],
+        },
+        "output_schema": {
+            "recall_event_ids": [f"up to {recall_limit} ranked event ids"],
+            "selected_event_ids": [f"up to {selected_event_limit} ranked event ids"],
+            "selected_path_ids": [f"up to {selected_path_limit} ranked path ids"],
+            "event_scores": {"optional selected event id only": "0..1"},
+            "path_scores": {"optional selected path id only": "0..1"},
+            "event_tunnel_support_scores": {"optional selected event id only": "0..1"},
+            "path_tunnel_support_scores": {"optional selected path id only": "0..1"},
+            "answer_plan_scores": {
+                "selected": {"optional selected event id only": "0..1"},
+                "current": {"optional selected event id only": "0..1"},
+                "historical": {"optional selected event id only": "0..1"},
+                "suppressed": {"optional selected event id only": "0..1"},
+            },
+            "answer_type_scores": {"direct_fact|multi_evidence|time|profile": "0..1"},
+            "focused_answer_type": "direct_fact|multi_evidence|time|profile|unknown",
+            "memory_router_scores": {"event|profile|resource|temporal|path_tunnel|topic_tunnel": "0..1"},
+            "reason": "short diagnostic, <=180 chars",
+        },
+    }
+    system_prompt = (
+        "You are the TMCRA runtime graph teacher. You replace a learned graph scorer, not the answer model. "
+        "Given a query and a compact memory graph, activate query-conditioned typed relations, score events and paths, "
+        "select evidence paths, and produce answer-plan scores. Use only provided ids. "
+        "Do not answer the user question. Return one compact strict JSON object only. "
+        "Never wrap JSON in markdown. Never output full score maps."
+    )
+    max_tokens = max(256, min(_int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_MAX_TOKENS", 1400), 4096))
+    request_payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)},
+        ],
+        "temperature": _float_env("TMCRA_DEEPSEEK_GRAPH_MODEL_TEMPERATURE", 0.0),
+        "max_tokens": max_tokens,
+    }
+    if _normalize(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_RESPONSE_FORMAT", "json_object")) not in {"off", "none", "false", "0"}:
+        request_payload["response_format"] = {"type": "json_object"}
+    timeout_seconds = max(5.0, _float_env("TMCRA_DEEPSEEK_GRAPH_MODEL_TIMEOUT_SECONDS", 120.0))
+    started = time.perf_counter()
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=json.dumps(request_payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        trace_path = _clean_text(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_TRACE_PATH", ""))
+        if trace_path:
+            try:
+                trace_file = Path(trace_path)
+                trace_file.parent.mkdir(parents=True, exist_ok=True)
+                trace_record = {
+                    "question": _clean_text(question),
+                    "model": model,
+                    "mode": mode,
+                    "elapsed_ms": elapsed_ms,
+                    "request_chars": len(json.dumps(request_payload, ensure_ascii=False)),
+                    "response": response_payload,
+                }
+                with trace_file.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(trace_record, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+        choices = list(response_payload.get("choices", []) or [])
+        choice = dict(choices[0] if choices else {})
+        message = dict(choice.get("message", {}) or {})
+        content: Any = message.get("content", "")
+        if isinstance(content, Mapping):
+            raw = dict(content)
+            raw_preview = json.dumps(raw, ensure_ascii=False)[:500]
+        else:
+            if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
+                content = "\n".join(
+                    _clean_text(item.get("text", item.get("content", "")) if isinstance(item, Mapping) else item)
+                    for item in content
+                )
+            if not _clean_text(content):
+                content = message.get("reasoning_content", "") or choice.get("text", "")
+            raw_preview = _clean_text(content)[:500]
+            raw = _deepseek_graph_teacher_extract_json(content)
+        if not raw:
+            return {
+                "deepseek_graph_model": {
+                    "mode": mode,
+                    "status": "empty_or_invalid_json",
+                    "model": model,
+                    "elapsed_ms": elapsed_ms,
+                    "finish_reason": _clean_text(choice.get("finish_reason", "")),
+                    "raw_preview": raw_preview,
+                }
+            }
+        return _deepseek_graph_teacher_normalize_output(
+            raw,
+            runtime_graph,
+            mode=mode,
+            model=model,
+            usage=dict(response_payload.get("usage", {}) or {}),
+            elapsed_ms=elapsed_ms,
+            candidate_event_ids=candidate_event_ids,
+            top_k=top_k,
+            support_path_k=support_path_k,
+        )
+    except Exception as exc:
+        return {
+            "deepseek_graph_model": {
+                "mode": mode,
+                "status": "failed",
+                "model": model,
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "error": f"{exc.__class__.__name__}: {_clean_text(str(exc))[:220]}",
+            }
+        }
+
+
+def _deepseek_graph_teacher_merge(local_scored: Mapping[str, Any], teacher_scored: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = dict(local_scored or {})
+    weight = max(0.0, min(1.0, _float_env("TMCRA_DEEPSEEK_GRAPH_MODEL_FUSION_WEIGHT", 0.55)))
+    for key in (
+        "recall_event_scores",
+        "base_event_scores",
+        "rerank_event_scores",
+        "calibrated_event_scores",
+        "matrix_event_scores",
+        "event_scores",
+        "event_tunnel_support_scores",
+        "event_tunnel_delta_scores",
+        "base_path_scores",
+        "calibrated_path_scores",
+        "rerank_path_scores",
+        "matrix_path_scores",
+        "path_model_scores",
+        "path_scores",
+        "path_tunnel_support_scores",
+        "path_tunnel_delta_scores",
+    ):
+        local_map = dict(merged.get(key, {}) or {})
+        teacher_map = dict(teacher_scored.get(key, {}) or {})
+        for item_id, teacher_score in teacher_map.items():
+            local_score = _deepseek_graph_teacher_score(local_map.get(item_id, 0.0))
+            fused = max(local_score, (1.0 - weight) * local_score + weight * _deepseek_graph_teacher_score(teacher_score))
+            local_map[item_id] = round(float(fused), 6)
+        merged[key] = local_map
+    merged["selected_event_ids"] = _bounded_event_id_union(
+        list(teacher_scored.get("selected_event_ids", []) or []),
+        list(merged.get("selected_event_ids", []) or []),
+        max_items=max(_HYBRID_SELECTED_EVENT_FLOOR, len(list(merged.get("selected_event_ids", []) or []))),
+    )
+    merged["selected_path_ids"] = _dedupe(
+        [
+            *list(teacher_scored.get("selected_path_ids", []) or []),
+            *list(merged.get("selected_path_ids", []) or []),
+        ],
+        max_items=max(1, _int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_FUSION_PATH_K", 8)),
+    )
+    merged["recall_event_ids"] = _bounded_event_id_union(
+        list(teacher_scored.get("recall_event_ids", []) or []),
+        list(merged.get("recall_event_ids", []) or []),
+        max_items=max(24, _int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_RECALL_EVENT_K", 24)),
+    )
+    local_plan = dict(merged.get("answer_plan_scores", {}) or {})
+    teacher_plan = dict(teacher_scored.get("answer_plan_scores", {}) or {})
+    for role in ("selected", "current", "historical", "suppressed"):
+        role_map = dict(local_plan.get(role, {}) or {})
+        for event_id, teacher_score in dict(teacher_plan.get(role, {}) or {}).items():
+            role_map[event_id] = max(_deepseek_graph_teacher_score(role_map.get(event_id, 0.0)), _deepseek_graph_teacher_score(teacher_score))
+        local_plan[role] = role_map
+    merged["answer_plan_scores"] = local_plan
+    merged["answer_type_scores"] = {
+        **dict(merged.get("answer_type_scores", {}) or {}),
+        **dict(teacher_scored.get("answer_type_scores", {}) or {}),
+    }
+    if _clean_text(teacher_scored.get("focused_answer_type", "")):
+        merged["focused_answer_type"] = _clean_text(teacher_scored.get("focused_answer_type", ""))
+    merged["deepseek_graph_model"] = dict(teacher_scored.get("deepseek_graph_model", {}) or {})
+    merged["deepseek_graph_model"]["fusion_weight"] = round(float(weight), 6)
+    merged["decision_score_source"] = f"{_clean_text(merged.get('decision_score_source', 'learned_decision_fusion'))}+deepseek_graph_teacher"
+    return merged
+
+
+def _deepseek_graph_teacher_replace_preserve_local(
+    local_scored: Mapping[str, Any],
+    teacher_scored: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Let the teacher own scores while preserving base graph hard evidence seats."""
+    merged = dict(teacher_scored or {})
+    local_selected_events = list(local_scored.get("selected_event_ids", []) or [])
+    local_selected_paths = list(local_scored.get("selected_path_ids", []) or [])
+    teacher_selected_events = list(teacher_scored.get("selected_event_ids", []) or [])
+    teacher_selected_paths = list(teacher_scored.get("selected_path_ids", []) or [])
+    preserve_local = _normalize(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_REPLACE_PRESERVE_LOCAL", "off")) not in {
+        "0",
+        "false",
+        "off",
+        "no",
+        "none",
+    }
+    if not preserve_local:
+        return merged
+
+    merged["selected_event_ids"] = _bounded_event_id_union(
+        teacher_selected_events,
+        local_selected_events,
+        max_items=max(_HYBRID_SELECTED_EVENT_FLOOR, len(local_selected_events), len(teacher_selected_events)),
+    )
+    merged["selected_path_ids"] = _dedupe(
+        [*teacher_selected_paths, *local_selected_paths],
+        max_items=max(1, len(local_selected_paths), len(teacher_selected_paths)),
+    )
+    merged["recall_event_ids"] = _bounded_event_id_union(
+        list(teacher_scored.get("recall_event_ids", []) or []),
+        list(local_scored.get("recall_event_ids", []) or []),
+        list(local_scored.get("rerank_candidate_event_ids", []) or []),
+        max_items=max(24, _int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_RECALL_EVENT_K", 24)),
+    )
+    merged["rerank_candidate_event_ids"] = _bounded_event_id_union(
+        list(merged.get("recall_event_ids", []) or []),
+        list(local_scored.get("rerank_candidate_event_ids", []) or []),
+        max_items=max(24, _int_env("TMCRA_DEEPSEEK_GRAPH_MODEL_RECALL_EVENT_K", 24)),
+    )
+
+    event_score_keys = (
+        "recall_event_scores",
+        "base_event_scores",
+        "rerank_event_scores",
+        "calibrated_event_scores",
+        "matrix_event_scores",
+        "event_scores",
+        "event_tunnel_support_scores",
+        "event_tunnel_delta_scores",
+    )
+    for key in event_score_keys:
+        score_map = dict(merged.get(key, {}) or {})
+        local_map = dict(local_scored.get(key, {}) or {})
+        for rank, event_id in enumerate(local_selected_events, start=1):
+            local_score = _deepseek_graph_teacher_score(local_map.get(event_id, 0.0))
+            score_map[event_id] = max(float(score_map.get(event_id, 0.0) or 0.0), max(0.58, local_score))
+        for rank, event_id in enumerate(list(local_scored.get("recall_event_ids", []) or [])[:24], start=1):
+            local_score = _deepseek_graph_teacher_score(local_map.get(event_id, 0.0))
+            score_map[event_id] = max(float(score_map.get(event_id, 0.0) or 0.0), max(0.28, local_score * 0.85))
+        merged[key] = score_map
+
+    path_score_keys = (
+        "base_path_scores",
+        "calibrated_path_scores",
+        "rerank_path_scores",
+        "matrix_path_scores",
+        "path_model_scores",
+        "path_scores",
+        "path_tunnel_support_scores",
+        "path_tunnel_delta_scores",
+    )
+    for key in path_score_keys:
+        score_map = dict(merged.get(key, {}) or {})
+        local_map = dict(local_scored.get(key, {}) or {})
+        for path_id in local_selected_paths:
+            local_score = _deepseek_graph_teacher_score(local_map.get(path_id, 0.0))
+            score_map[path_id] = max(float(score_map.get(path_id, 0.0) or 0.0), max(0.52, local_score))
+        merged[key] = score_map
+
+    local_plan = dict(local_scored.get("answer_plan_scores", {}) or {})
+    teacher_plan = dict(merged.get("answer_plan_scores", {}) or {})
+    for role in ("selected", "current", "historical", "suppressed"):
+        role_map = dict(teacher_plan.get(role, {}) or {})
+        local_role_map = dict(local_plan.get(role, {}) or {})
+        if role in {"selected", "current"}:
+            for event_id in local_selected_events:
+                role_map[event_id] = max(
+                    _deepseek_graph_teacher_score(role_map.get(event_id, 0.0)),
+                    _deepseek_graph_teacher_score(local_role_map.get(event_id, 0.0)),
+                    0.48,
+                )
+        teacher_plan[role] = role_map
+    merged["answer_plan_scores"] = teacher_plan
+
+    metadata = dict(merged.get("deepseek_graph_model", {}) or {})
+    metadata["replace_preserve_local"] = True
+    metadata["preserved_local_event_count"] = int(len(local_selected_events))
+    metadata["preserved_local_path_count"] = int(len(local_selected_paths))
+    metadata["selected_event_count"] = int(len(merged.get("selected_event_ids", []) or []))
+    metadata["selected_path_count"] = int(len(merged.get("selected_path_ids", []) or []))
+    merged["deepseek_graph_model"] = metadata
+    merged["decision_score_source"] = "deepseek_graph_teacher+local_hard_seats"
+    return merged
+
+
+def _build_symbolic_recall_index(
     runtime_graph: Mapping[str, Any],
     *,
     grouped_hits: Mapping[str, Sequence[MemoryHit]],
-    limit: int,
-) -> List[str]:
-    question_features = extract_question_features(query)
-    query_tokens = set(_hybrid_symbolic_tokens(question_features.get("question_anchor_tokens", []) or query))
-    if not query_tokens:
-        return []
+) -> Dict[str, Any]:
     nodes_by_id = {
         _clean_text(node.get("id", "")): dict(node)
         for node in list(runtime_graph.get("nodes", []) or [])
@@ -514,15 +1279,41 @@ def _symbolic_recall_event_ids(
             metadata = dict(hit.metadata or {})
             payloads.extend([hit.value, hit.slot_key, hit.category, hit.relation, *hit.anchors, *metadata.values()])
 
+    return {
+        "event_tokens": {
+            event_id: frozenset(_hybrid_symbolic_tokens(payloads))
+            for event_id, payloads in event_payloads.items()
+        },
+        "event_turn_indices": {
+            event_id: int(nodes_by_id.get(event_id, {}).get("turn_index", 0) or 0)
+            for event_id in event_payloads
+        },
+    }
+
+
+def _symbolic_recall_event_ids(
+    query: str,
+    runtime_graph: Mapping[str, Any],
+    *,
+    grouped_hits: Mapping[str, Sequence[MemoryHit]],
+    limit: int,
+    symbolic_index: Mapping[str, Any] | None = None,
+) -> List[str]:
+    question_features = extract_question_features(query)
+    query_tokens = set(_hybrid_symbolic_tokens(question_features.get("question_anchor_tokens", []) or query))
+    if not query_tokens:
+        return []
+    resolved_index = dict(symbolic_index or _build_symbolic_recall_index(runtime_graph, grouped_hits=grouped_hits))
+    event_tokens_by_id = dict(resolved_index.get("event_tokens", {}) or {})
+    event_turn_indices = dict(resolved_index.get("event_turn_indices", {}) or {})
+
     scored_events: List[tuple[str, float]] = []
-    for event_id, payloads in event_payloads.items():
-        event_tokens = set(_hybrid_symbolic_tokens(payloads))
+    for event_id, event_tokens in event_tokens_by_id.items():
         overlap = query_tokens & event_tokens
         if not overlap:
             continue
         overlap_ratio = float(len(overlap)) / float(max(1, len(query_tokens)))
-        event_node = nodes_by_id.get(event_id, {})
-        turn_index = int(event_node.get("turn_index", 0) or 0)
+        turn_index = int(event_turn_indices.get(event_id, 0) or 0)
         scored_events.append((event_id, (len(overlap) * 4.0) + overlap_ratio + min(turn_index, 1000) * 0.000001))
     return [
         event_id
@@ -676,8 +1467,16 @@ def _embedder_dense_vectors_for_texts(texts: Sequence[str], *, mode: str) -> tup
     try:
         cached = _EMBEDDER_MODEL_CACHE.get(cache_key)
         if cached is None:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)
-            model = AutoModel.from_pretrained(model_name, trust_remote_code=False)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                local_files_only=True,
+                trust_remote_code=False,
+            )
+            model = AutoModel.from_pretrained(
+                model_name,
+                local_files_only=True,
+                trust_remote_code=False,
+            )
             model.to(device)
             model.eval()
             cached = (tokenizer, model)
@@ -1643,7 +2442,38 @@ def _hit_matches_path_support(path_type: str, hit: MemoryHit) -> bool:
 def _support_hit_for_path(path_type: str, group_hits: Sequence[MemoryHit]) -> MemoryHit | None:
     matching_hits = [hit for hit in group_hits if _hit_matches_path_support(path_type, hit)]
     if matching_hits:
-        matching_hits.sort(key=lambda item: (float(item.score), int(item.turn_index)), reverse=True)
+        if _clean_text(path_type) == "speaker_event_source_turn":
+            def source_turn_rank(item: MemoryHit) -> tuple[int, int, int, int, float, int]:
+                metadata = dict(item.metadata or {})
+                source_kind = _clean_text(item.source_kind)
+                relation = _clean_text(item.relation)
+                memory_id = _clean_text(item.memory_id)
+                value = _clean_text(item.value)
+                source_text = _clean_text(
+                    metadata.get("source_turn_text", "")
+                    or metadata.get("raw_text", "")
+                    or metadata.get("origin_query", "")
+                )
+                is_source_turn = int(source_kind == "public_dialog_turn" or relation == "source_turn_grounding")
+                is_source_text = int(source_kind in {"public_dialog_text", "public_dialog_auxiliary_evidence"})
+                has_source_text = int(bool(source_text) and len(source_text) >= 80)
+                is_unit_attachment = int(
+                    source_kind == "event_action_frame_attachment"
+                    or ".unit." in memory_id
+                    or ".profile." in memory_id
+                )
+                return (
+                    is_source_turn,
+                    is_source_text,
+                    has_source_text,
+                    -is_unit_attachment,
+                    float(item.score),
+                    len(value),
+                )
+
+            matching_hits.sort(key=source_turn_rank, reverse=True)
+        else:
+            matching_hits.sort(key=lambda item: (float(item.score), int(item.turn_index)), reverse=True)
         return matching_hits[0]
     representative = _representative_event_hit(group_hits)
     return representative
@@ -1672,9 +2502,27 @@ def _dia_ids_from_hits(hits: Sequence[MemoryHit]) -> List[str]:
     )
 
 
+def _low_information_support_hit(hit: MemoryHit) -> bool:
+    text = _clean_text(hit.value)
+    if not text:
+        return True
+    alpha_tokens = re.findall(r"[a-zA-Z][a-zA-Z_-]{2,}", text)
+    number_tokens = re.findall(r"\d+", text)
+    if len(alpha_tokens) <= 1 and number_tokens:
+        return True
+    if len(text) <= 24 and number_tokens and len(alpha_tokens) <= 2:
+        return True
+    source_kind = _clean_text(hit.source_kind)
+    memory_id = _clean_text(hit.memory_id)
+    if source_kind == "event_action_frame_attachment" and ".unit.numeric." in memory_id and len(alpha_tokens) <= 2:
+        return True
+    return False
+
+
 def _final_hit_role_priority(hit: MemoryHit) -> int:
     metadata = dict(hit.metadata or {})
     source_kind = _clean_text(hit.source_kind)
+    low_information = _low_information_support_hit(hit)
     semantic_source_kinds = {
         "public_dialog_fact",
         "public_dialog_preference",
@@ -1686,14 +2534,16 @@ def _final_hit_role_priority(hit: MemoryHit) -> int:
         "replacement_memory",
         "session_memory",
     }
-    if source_kind in semantic_source_kinds or (
+    if not low_information and (source_kind in semantic_source_kinds or (
         source_kind != "public_dialog_turn" and bool(_clean_text(metadata.get("memory_writer_role", "")))
-    ):
+    )):
         return 0
     if bool(metadata.get("profile_first_source_support")):
         return 0
     role = _clean_text(metadata.get("evidence_snippet_role", ""))
     if role == "selected_path_support":
+        if low_information:
+            return 4
         return 1
     if role == "selected_event_representative":
         return 2
@@ -1715,13 +2565,20 @@ def _coverage_preserving_final_hits(
     the top-k boundary, which hides recall/rerank successes from the answer head.
     """
 
-    budget = max(1, int(top_k or 1))
     hits = list(final_hits)
     selected_order = [
         _clean_text(event_id)
         for event_id in selected_event_ids
         if _clean_text(event_id)
-    ][:budget]
+    ]
+    try:
+        extra_selected_budget = max(0, _int_env("TMCRA_SELECTED_EVENT_COVERAGE_EXTRA_K", 4))
+    except Exception:
+        extra_selected_budget = 4
+    budget = max(1, int(top_k or 1))
+    if selected_order and extra_selected_budget:
+        budget = max(budget, min(len(selected_order), int(top_k or 1) + extra_selected_budget))
+    selected_order = selected_order[:budget]
     if not selected_order:
         return sorted(hits, key=lambda item: float(item.score), reverse=True)[:budget]
     hits_by_event: Dict[str, List[MemoryHit]] = {}
@@ -1752,6 +2609,31 @@ def _coverage_preserving_final_hits(
         if len(selected) >= budget:
             break
     return selected[:budget]
+
+
+def _add_multi_evidence_recall_coverage(
+    selected_event_ids: Sequence[str],
+    recall_event_ids: Sequence[str],
+    *,
+    focused_answer_type: str,
+    top_k: int,
+) -> List[str]:
+    focused = _clean_text(focused_answer_type)
+    if focused not in {"multi_evidence", "multi", "aggregation", "chain"}:
+        return _dedupe(selected_event_ids)
+    try:
+        coverage_k = max(0, _int_env("TMCRA_MULTI_EVIDENCE_RECALL_COVERAGE_K", 8))
+    except Exception:
+        coverage_k = 8
+    if coverage_k <= 0:
+        return _dedupe(selected_event_ids)
+    return _dedupe(
+        [
+            *[_clean_text(event_id) for event_id in selected_event_ids if _clean_text(event_id)],
+            *[_clean_text(event_id) for event_id in list(recall_event_ids or [])[:coverage_k] if _clean_text(event_id)],
+        ],
+        max_items=max(len(list(selected_event_ids or [])), int(top_k or 1) + coverage_k),
+    )
 
 
 def _dominant_answer_type(question_analysis: Dict[str, Any], answer_type_scores: Dict[str, Any]) -> str:
@@ -2500,6 +3382,8 @@ def _build_runtime_graph_from_hits(query: str, hits: Sequence[MemoryHit]) -> Dic
 def _public_graph_hits(graph: SessionMemoryGraphV2) -> List[MemoryHit]:
     public_hits: List[MemoryHit] = []
     for record in graph.records_by_id.values():
+        if _normalize(dict(record.metadata or {}).get("memory_layer", "")) == "slow":
+            continue
         if record.state != "active":
             continue
         if not _clean_text(record.source_kind).startswith("public_dialog"):
@@ -2827,6 +3711,8 @@ def _learnable_graph_hits(graph: SessionMemoryGraphV2) -> List[MemoryHit]:
     for record in graph.records_by_id.values():
         state = _normalize(record.state)
         metadata = dict(record.metadata or {})
+        if _normalize(metadata.get("memory_layer", "")) == "slow":
+            continue
         is_source_grounded_evidence = (
             state == "evidence"
             and (
@@ -3699,8 +4585,13 @@ def _facet_query_pack_hits(
     if not numeric_query and not temporal_query and not any("facet" in _normalize(token) for token in query_tokens):
         return {"hits": list(final_hits), "metadata": {"facet_query_pack_enabled": False, "facet_query_pack_reason": "no_facet_intent"}}
 
+    records = list(getattr(graph, "records_by_id", {}).values())
+    first_record_by_slot_key: Dict[str, SessionMemoryRecordV2] = {}
+    for candidate in records:
+        first_record_by_slot_key.setdefault(_clean_text(candidate.slot_key).lower(), candidate)
+
     candidate_rows: List[tuple[float, SessionMemoryRecordV2, SessionMemoryRecordV2 | None, Dict[str, Any]]] = []
-    for record in getattr(graph, "records_by_id", {}).values():
+    for record in records:
         metadata = dict(record.metadata or {})
         if _normalize(metadata.get("content_variant", "")) != "event_facet_write":
             continue
@@ -3708,14 +4599,7 @@ def _facet_query_pack_hits(
             continue
         facet_type = _normalize(metadata.get("facet_type", ""))
         parent_slot_key = _clean_text(metadata.get("facet_parent_slot_key", ""))
-        parent = next(
-            (
-                candidate
-                for candidate in getattr(graph, "records_by_id", {}).values()
-                if _clean_text(candidate.slot_key).lower() == parent_slot_key.lower()
-            ),
-            None,
-        )
+        parent = first_record_by_slot_key.get(parent_slot_key.lower())
         parent_text = " ".join(
             [
                 _clean_text(parent.value if parent else ""),
@@ -3957,6 +4841,7 @@ _MULTI_UNIT_CHAIN_FOCUS_DROP_TOKENS = {
 _MULTI_UNIT_CHAIN_FACET_TYPES = {"action", "entity", "numeric", "role", "evidence_role", "state", "temporal"}
 _MULTI_UNIT_CHAIN_UNIT_KINDS = {
     "action_unit",
+    "semantic_event",
     "target_entity",
     "numeric_quantity",
     "leadership_role",
@@ -3995,35 +4880,14 @@ def _multi_unit_chain_numeric_signal(
     text: str,
     tokens: set[str],
 ) -> float:
-    compact_text = _clean_text(text)
-    date_like_only = bool(
-        re.fullmatch(
-            r"(?:\d{4}[/-]\d{1,2}(?:[/-]\d{1,2})?|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}/\d{2})",
-            compact_text,
-        )
-    )
-    if date_like_only:
-        return 0.0
     signal = 0.0
     if unit_kind == "numeric_quantity" or facet_type == "numeric":
         signal += 0.55
     if tokens & _MULTI_UNIT_CHAIN_NUMERIC_VALUE_TOKENS:
         signal += 0.28
-    if re.search(r"(?:[$€£¥]\s*\d|\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:dollars?|usd|bucks?|yuan|rmb)\b)", text, flags=re.IGNORECASE):
-        signal += 0.72
-    elif re.search(r"\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:comments?|items?|pieces?|kits?|projects?|doctors?|weddings?|hours?|weeks?|days?|months?|years?|miles?)\b", text, flags=re.IGNORECASE):
+    if re.search(r"(?:[$€£¥]\s*\d|\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:dollars?|usd|bucks?|yuan|rmb|hours?|weeks?|days?|months?)\b)", text, flags=re.IGNORECASE):
         signal += 0.42
     return min(1.1, signal)
-
-
-def _multi_unit_chain_date_like_numeric(text: str) -> bool:
-    compact_text = _clean_text(text)
-    return bool(
-        re.fullmatch(
-            r"(?:\d{4}[/-]\d{1,2}(?:[/-]\d{1,2})?|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}/\d{2})",
-            compact_text,
-        )
-    )
 
 
 def _multi_unit_chain_temporal_anchor_signal(text: str, tokens: set[str]) -> float:
@@ -4469,7 +5333,6 @@ def _multi_unit_chain_hit_text(record: SessionMemoryRecordV2, parent: SessionMem
 
 def _multi_unit_chain_local_hit_text(record: SessionMemoryRecordV2, parent: SessionMemoryRecordV2 | None) -> str:
     metadata = dict(record.metadata or {})
-    parent_metadata = dict(parent.metadata or {}) if parent is not None else {}
     return " ".join(
         [
             _clean_text(record.value),
@@ -4484,8 +5347,6 @@ def _multi_unit_chain_local_hit_text(record: SessionMemoryRecordV2, parent: Sess
             _clean_text(metadata.get("target", "")),
             _clean_text(metadata.get("quantity", "")),
             _clean_text(metadata.get("status", "")),
-            _clean_text(parent.value if parent else ""),
-            _clean_text(parent_metadata.get("source_span", "")),
         ]
     )
 
@@ -4544,12 +5405,34 @@ def _multi_unit_chain_slot_hits(
         if record.state not in {"active", "parallel_active", "evidence"}:
             continue
         profile_shadow_unit = _profile_shadow_eventlike_record(record, metadata)
+        semantic_event_record = bool(
+            _normalize(metadata.get("content_variant", "")) == "llm_semantic_write"
+            and (
+                _normalize(record.category) == "event"
+                or _normalize(record.source_kind).startswith("public_dialog_event")
+            )
+        )
         if profile_shadow_unit:
             facet_type = "action"
             unit_kind = "profile_shadow_unit"
             parent_slot = _clean_text(record.slot_key).lower()
             parent = None
             text = _profile_shadow_unit_text(record, metadata)
+            local_text = text
+        elif semantic_event_record:
+            facet_type = "action"
+            unit_kind = "semantic_event"
+            parent_slot = _clean_text(record.slot_key).lower()
+            parent = None
+            text = " ".join(
+                [
+                    _clean_text(record.value),
+                    _clean_text(record.category),
+                    _clean_text(record.relation),
+                    _clean_text(metadata.get("source_span", "")),
+                    _clean_text(metadata.get("raw_text", "")),
+                ]
+            )
             local_text = text
         else:
             if _normalize(metadata.get("content_variant", "")) != "event_facet_write":
@@ -4571,17 +5454,20 @@ def _multi_unit_chain_slot_hits(
         if not focus_overlap:
             continue
         score = min(1.2, len(focus_overlap) / max(1.0, len(focus_tokens)) * 1.6)
-        local_numeric_signal = _multi_unit_chain_numeric_signal(unit_kind, facet_type, local_text, local_tokens)
-        if _multi_unit_chain_date_like_numeric(local_text):
-            numeric_signal = 0.0
-        else:
-            numeric_signal = local_numeric_signal
-            if numeric_signal <= 0.0:
-                numeric_signal = _multi_unit_chain_numeric_signal(unit_kind, facet_type, text, unit_tokens)
+        numeric_signal = _multi_unit_chain_numeric_signal(unit_kind, facet_type, text, unit_tokens)
         temporal_anchor_signal = _multi_unit_chain_temporal_anchor_signal(text, unit_tokens)
+        local_focus_overlap = focus_tokens & local_tokens
         local_temporal_anchor_signal = _multi_unit_chain_temporal_anchor_signal(local_text, local_tokens)
+        if not semantic_event_record and not profile_shadow_unit and not local_focus_overlap:
+            # A child unit should not enter a multi-unit chain only because its
+            # long parent window mentions the query topic. Otherwise assistant
+            # advice fragments under a relevant parent consume coverage slots.
+            if not (temporal_comparison_intent and local_temporal_anchor_signal > 0.0):
+                continue
         if facet_type in {"action", "entity", "role", "numeric"}:
             score += 0.34
+        if local_focus_overlap:
+            score += min(0.30, len(local_focus_overlap) * 0.10)
         if unit_kind in {"action_unit", "target_entity", "leadership_role", "participation_role", "numeric_quantity"}:
             score += 0.24
         if profile_shadow_unit:
@@ -4606,6 +5492,9 @@ def _multi_unit_chain_slot_hits(
                 parent,
                 {
                     "multi_unit_chain_focus_overlap_tokens": sorted(focus_overlap)[:16],
+                    "multi_unit_chain_focus_overlap_count": len(focus_overlap),
+                    "multi_unit_chain_local_focus_overlap_tokens": sorted(local_focus_overlap)[:16],
+                    "multi_unit_chain_local_focus_overlap_count": len(local_focus_overlap),
                     "multi_unit_chain_score": round(score, 6),
                     "multi_unit_chain_numeric_signal": round(numeric_signal, 6),
                     "multi_unit_chain_temporal_anchor_signal": round(temporal_anchor_signal, 6),
@@ -4645,6 +5534,8 @@ def _multi_unit_chain_slot_hits(
                 if _normalize(item[3].get("unit_kind", "")) == "numeric_quantity"
                 or _normalize(item[3].get("facet_type", "")) == "numeric"
                 else 1,
+                float(item[3].get("multi_unit_chain_score", 0.0) or 0.0),
+                int(item[3].get("multi_unit_chain_focus_overlap_count", 0) or 0),
                 float(item[0]),
                 int(item[1].turn_index),
             ),
@@ -4664,6 +5555,8 @@ def _multi_unit_chain_slot_hits(
                     or _normalize(item[3].get("facet_type", "")) == "numeric"
                     else 1.0
                 ),
+                float(item[3].get("multi_unit_chain_score", 0.0) or 0.0),
+                int(item[3].get("multi_unit_chain_focus_overlap_count", 0) or 0),
                 float(item[0]),
                 int(item[1].turn_index),
             ),
@@ -4672,7 +5565,7 @@ def _multi_unit_chain_slot_hits(
     selected: List[tuple[float, SessionMemoryRecordV2, SessionMemoryRecordV2 | None, Dict[str, Any]]] = []
     seen_parent_slots: set[str] = set()
     seen_values: set[str] = set()
-    max_units = max(2, min(8, int(os.getenv("TMCRA_MULTI_UNIT_CHAIN_SLOT_MAX_UNITS", "6") or 6)))
+    max_units = max(2, min(10, int(os.getenv("TMCRA_MULTI_UNIT_CHAIN_SLOT_MAX_UNITS", "8") or 8)))
     for item in candidates:
         _, record, parent, metadata = item
         parent_slot = _clean_text(metadata.get("multi_unit_chain_parent_slot_key", ""))
@@ -5024,6 +5917,7 @@ def _profile_focused_pack_hits(
     final_hits: Sequence[MemoryHit],
     *,
     top_k: int,
+    grouped_hits: Mapping[str, Sequence[MemoryHit]],
 ) -> Dict[str, Any]:
     intent = infer_profile_query_intent(query)
     if not bool(intent.get("enabled")):
@@ -5034,8 +5928,8 @@ def _profile_focused_pack_hits(
                 "profile_focused_pack_reason": "profile_intent_not_requested",
             },
         }
-    source_hits = _learnable_graph_hits(graph)
-    if not source_hits:
+    resolved_grouped_hits = dict(grouped_hits or {})
+    if not resolved_grouped_hits:
         return {
             "hits": list(final_hits),
             "metadata": {
@@ -5043,12 +5937,10 @@ def _profile_focused_pack_hits(
                 "profile_focused_pack_reason": "no_learnable_hits",
             },
         }
-    runtime_graph = _build_runtime_graph_from_hits(query, source_hits)
-    grouped_hits = dict(runtime_graph.get("grouped_hits", {}) or {})
     profile_first_payload = _profile_first_hybrid_rescue(
         graph,
         query,
-        grouped_hits=grouped_hits,
+        grouped_hits=resolved_grouped_hits,
         top_k=max(2, min(max(1, int(top_k or 1)), 4)),
     )
     profile_first_hits = list(profile_first_payload.get("hits", []) or [])
@@ -5652,6 +6544,15 @@ class NullMemoryAdapter(MemoryAdapter):
         }
 
 
+def _serialized_adapter_call(method):
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._operation_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class GraphSessionMemoryAdapter(MemoryAdapter):
     name = "graph_session_memory_v2"
 
@@ -5692,6 +6593,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         temporal_router_latest_path: str = "",
         temporal_router_device: str = "",
     ) -> None:
+        self._operation_lock = threading.RLock()
         prewarm_embedder_mode = (
             _normalize(os.getenv("TMCRA_EMBEDDER_INDEX_RECALL_MODE", ""))
             or _normalize(os.getenv("TMCRA_WRITE_EMBEDDER_INDEX_MODE", ""))
@@ -5723,6 +6625,11 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             )
         else:
             raise ValueError(f"Unsupported storage backend: {self.storage_backend}")
+        self._runtime_graph_cache_epoch = 0
+        self._runtime_graph_cache_key: tuple[Any, ...] | None = None
+        self._runtime_graph_cache_source_hits: List[MemoryHit] | None = None
+        self._runtime_graph_cache_payload: Dict[str, Any] | None = None
+        self._runtime_graph_cache_symbolic_index: Dict[str, Any] | None = None
         self._last_retrieval_context_tokens = 0
         self._last_writeback_summary: Dict[str, Any] = {}
         self.retrieval_mode = _normalize(retrieval_mode) or "heuristic"
@@ -5853,7 +6760,6 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         self.temporal_router_latest_path = _clean_text(
             temporal_router_latest_path
             or os.getenv("TMCRA_TEMPORAL_ROUTER_LATEST", "")
-            or "models/temporal_router_v1_latest.txt"
         )
         self.temporal_router_device = _clean_text(
             temporal_router_device or os.getenv("TMCRA_TEMPORAL_ROUTER_DEVICE", "")
@@ -5879,6 +6785,50 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 audit_retention=self.audit_retention,
             )
 
+    def _invalidate_runtime_graph_cache(self) -> None:
+        self._runtime_graph_cache_epoch += 1
+        self._runtime_graph_cache_key = None
+        self._runtime_graph_cache_source_hits = None
+        self._runtime_graph_cache_payload = None
+        self._runtime_graph_cache_symbolic_index = None
+
+    def _runtime_graph_static_cache_key(self) -> tuple[Any, ...]:
+        algorithm_version = "tmcra.runtime-graph.static.1"
+        if self._store is not None:
+            revision = getattr(self.graph, "_storage_revision", None)
+            if revision is None:
+                raise RuntimeError("SQLite graph is missing storage_revision required for runtime graph caching")
+            return (
+                algorithm_version,
+                "sqlite",
+                str(Path(self.storage_path).resolve()),
+                self.scope_id,
+                int(revision),
+                int(len(getattr(self.graph, "records_by_id", {}) or {})),
+            )
+
+        record_payload = [
+            record.to_dict()
+            for record in list(getattr(self.graph, "records_by_id", {}).values())
+        ]
+        record_fingerprint = hashlib.sha256(
+            json.dumps(
+                record_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        return (
+            algorithm_version,
+            "memory",
+            self.storage_path,
+            self.scope_id,
+            int(self._runtime_graph_cache_epoch),
+            record_fingerprint,
+        )
+
     def _persist_graph(self) -> None:
         self.graph.configure_persistence(
             backend=self.storage_backend,
@@ -5887,7 +6837,32 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         )
         if self._store is not None:
             self._store.save_graph(self.scope_id, self.graph)
+        self._invalidate_runtime_graph_cache()
 
+    def _persist_latest_audit(self, field_name: str) -> Dict[str, Any]:
+        self.graph.configure_persistence(
+            backend=self.storage_backend,
+            path=self.storage_path,
+            audit_retention=self.audit_retention,
+        )
+        events = getattr(self.graph, field_name)
+        if not events:
+            raise RuntimeError(f"cannot persist empty audit field: {field_name}")
+        if self._store is None:
+            return dict(events[-1])
+        persisted = self._store.append_audit_event(
+            self.scope_id,
+            field_name,
+            dict(events[-1]),
+        )
+        events[-1] = dict(persisted["payload"])
+        self.graph.audit_event_totals[field_name] = int(persisted["event_total"])
+        self.graph.audit_trimmed_counts[field_name] = int(
+            persisted["trimmed_total"]
+        )
+        return dict(events[-1])
+
+    @_serialized_adapter_call
     def replace_graph(self, graph: SessionMemoryGraphV2) -> None:
         self.graph = graph
         self._persist_graph()
@@ -5921,12 +6896,14 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             "total_state_token_estimate": int(core_state_token_estimate + audit_state_token_estimate),
         }
 
+    @_serialized_adapter_call
     def reset(self) -> None:
         if self._store is not None:
             self._store.clear_scope(self.scope_id)
             self.graph = self._store.load_graph(self.scope_id)
         else:
             self.graph = self._empty_graph()
+        self._invalidate_runtime_graph_cache()
         self._last_retrieval_context_tokens = 0
         self._last_writeback_summary = {}
 
@@ -6322,6 +7299,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         )
         return {"hits": merged[: max(len(merged), top_k)], "metadata": metadata}
 
+    @_serialized_adapter_call
     def ingest_turn(
         self,
         user_text: str,
@@ -6405,6 +7383,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         )
         self._persist_graph()
 
+    @_serialized_adapter_call
     def ingest_answer_writeback(
         self,
         *,
@@ -6506,6 +7485,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         self._persist_graph()
         return stored_ids
 
+    @_serialized_adapter_call
     def last_writeback_summary(self) -> Dict[str, Any]:
         return dict(self._last_writeback_summary)
 
@@ -7030,7 +8010,43 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         top_k: int,
         public_hits: Sequence[MemoryHit] | None = None,
     ) -> Dict[str, Any]:
+        hybrid_profile_enabled = _normalize(os.getenv("TMCRA_HYBRID_RUNTIME_PROFILE", "")) in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        hybrid_profile_started = time.perf_counter()
+        hybrid_profile_last = hybrid_profile_started
+        hybrid_profile: Dict[str, float] = {}
+
+        def _hybrid_mark(name: str) -> None:
+            nonlocal hybrid_profile_last
+            if not hybrid_profile_enabled:
+                return
+            now = time.perf_counter()
+            hybrid_profile[name] = round(now - hybrid_profile_last, 6)
+            hybrid_profile_last = now
+
+        def _hybrid_profile_payload() -> Dict[str, Any]:
+            if not hybrid_profile_enabled:
+                return {}
+            return {
+                "enabled": True,
+                **hybrid_profile,
+                "total_sec": round(time.perf_counter() - hybrid_profile_started, 6),
+                "runtime_graph_cache_hit": bool(runtime_graph_cache_hit),
+                "source_hit_count": int(len(source_hits)),
+                "runtime_event_count": int(len(candidate_event_ids)),
+                "runtime_path_count": int(len(list(runtime_graph.get("paths", []) or []))),
+                "hybrid_candidate_event_count": int(len(hybrid_candidate_event_ids)),
+                "selected_event_count": int(len(selected_event_ids)),
+                "selected_path_count": int(len(selected_path_ids)),
+                "final_hit_count": int(len(final_hits)),
+            }
+
         scorer = self._node_scorer()
+        _hybrid_mark("scorer_init_sec")
         if scorer is None:
             return {
                 "hits": list(hits),
@@ -7040,7 +8056,18 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                     "hybrid_error": self._node_scorer_error,
                 },
             }
-        source_hits = _learnable_graph_hits(self.graph)
+        runtime_graph_cache_key = self._runtime_graph_static_cache_key()
+        runtime_graph_cache_hit = bool(
+            runtime_graph_cache_key == self._runtime_graph_cache_key
+            and self._runtime_graph_cache_source_hits is not None
+            and self._runtime_graph_cache_payload is not None
+            and self._runtime_graph_cache_symbolic_index is not None
+        )
+        if runtime_graph_cache_hit:
+            source_hits = self._runtime_graph_cache_source_hits
+        else:
+            source_hits = _learnable_graph_hits(self.graph)
+        _hybrid_mark("source_hits_sec")
         if not source_hits:
             return {
                 "hits": list(hits),
@@ -7061,8 +8088,25 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             hybrid_source = "public_full_graph"
         elif has_generic_hits and not has_public_hits:
             hybrid_source = "generic_full_graph"
-        runtime_graph = _build_runtime_graph_from_hits(query, source_hits)
+        if runtime_graph_cache_hit:
+            runtime_graph = dict(self._runtime_graph_cache_payload or {})
+            runtime_graph["query"] = query
+            symbolic_recall_index = self._runtime_graph_cache_symbolic_index or {}
+        else:
+            runtime_graph = _build_runtime_graph_from_hits(query, source_hits)
+            grouped_hits = dict(runtime_graph.get("grouped_hits", {}) or {})
+            symbolic_recall_index = _build_symbolic_recall_index(
+                runtime_graph,
+                grouped_hits=grouped_hits,
+            )
+            cached_runtime_graph = dict(runtime_graph)
+            cached_runtime_graph["query"] = ""
+            self._runtime_graph_cache_key = runtime_graph_cache_key
+            self._runtime_graph_cache_source_hits = source_hits
+            self._runtime_graph_cache_payload = cached_runtime_graph
+            self._runtime_graph_cache_symbolic_index = symbolic_recall_index
         grouped_hits = dict(runtime_graph.get("grouped_hits", {}) or {})
+        _hybrid_mark("runtime_graph_build_sec")
         profile_first_payload = _profile_first_hybrid_rescue(
             self.graph,
             query,
@@ -7072,6 +8116,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         profile_first_hits = list(profile_first_payload.get("hits", []) or [])
         profile_first_event_ids = list(profile_first_payload.get("event_ids", []) or [])
         profile_first_memory_ids = list(profile_first_payload.get("memory_ids", []) or [])
+        _hybrid_mark("profile_first_rescue_sec")
         candidate_event_ids = sorted(grouped_hits.keys())
         if not candidate_event_ids:
             return {
@@ -7121,6 +8166,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 pre_embedder_event_ids,
                 max_items=hybrid_candidate_limit,
             )
+        _hybrid_mark("query_and_pre_recall_prep_sec")
         pre_score_kwargs = {
             "graph": runtime_graph,
             "question": query,
@@ -7137,6 +8183,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             scorer.score_runtime,
             **pre_score_kwargs,
         )
+        _hybrid_mark("initial_score_runtime_sec")
         memory_router_decision = _memory_router_decision(
             scored,
             mode=self.memory_router_mode,
@@ -7163,17 +8210,20 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             max_items=max(1, len(candidate_event_ids)),
         )
         learned_recall_event_ids = list(model_recall_event_ids)
+        _hybrid_mark("router_and_learned_recall_sec")
         symbolic_recall_event_ids = _symbolic_recall_event_ids(
             query,
             runtime_graph,
             grouped_hits=grouped_hits,
             limit=hybrid_candidate_limit,
+            symbolic_index=symbolic_recall_index,
         )
         symbolic_recall_event_ids = _bounded_event_id_union(
             profile_first_event_ids,
             symbolic_recall_event_ids,
             max_items=hybrid_candidate_limit,
         )
+        _hybrid_mark("symbolic_recall_sec")
         if pre_embedder_event_ids:
             embedder_index_payload = pre_embedder_index_payload
         else:
@@ -7196,6 +8246,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 "embedder_pre_recall_candidate_count": int(len(pre_candidate_event_ids)),
             }
         )
+        _hybrid_mark("embedder_index_recall_sec")
         hybrid_candidate_event_ids = _bounded_event_id_union(
             profile_first_event_ids,
             embedder_index_event_ids,
@@ -7215,6 +8266,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         ]
         hybrid_candidate_union_priority_changed = list(hybrid_candidate_event_ids) != list(learned_candidate_event_ids)
         hybrid_candidate_union_rescored = False
+        _hybrid_mark("candidate_union_finalize_sec")
         if hybrid_candidate_union_added_event_ids or (embedder_index_event_ids and hybrid_candidate_union_priority_changed):
             scored = _call_with_supported_kwargs(
                 scorer.score_runtime,
@@ -7235,6 +8287,68 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 threshold=self.memory_router_threshold,
                 margin=self.memory_router_margin,
             )
+        _hybrid_mark("optional_rescore_sec")
+        deepseek_graph_teacher_payload: Dict[str, Any] = {}
+        deepseek_graph_teacher_mode = _deepseek_graph_teacher_mode()
+        if deepseek_graph_teacher_mode != "off":
+            teacher_scored = _deepseek_graph_teacher_call(
+                runtime_graph,
+                query,
+                candidate_event_ids=hybrid_candidate_event_ids,
+                top_k=top_k,
+                support_path_k=self.support_path_k,
+                local_scored=scored,
+            )
+            deepseek_graph_teacher_payload = dict(teacher_scored.get("deepseek_graph_model", {}) or {})
+            teacher_has_scores = bool(
+                teacher_scored.get("event_scores")
+                or teacher_scored.get("path_scores")
+                or teacher_scored.get("selected_event_ids")
+                or teacher_scored.get("selected_path_ids")
+            )
+            if teacher_has_scores and deepseek_graph_teacher_mode == "replace":
+                scored = _deepseek_graph_teacher_replace_preserve_local(scored, teacher_scored)
+                memory_router_decision = _memory_router_decision(
+                    scored,
+                    mode=self.memory_router_mode,
+                    threshold=self.memory_router_threshold,
+                    margin=self.memory_router_margin,
+                )
+            elif teacher_has_scores and deepseek_graph_teacher_mode == "fusion":
+                scored = _deepseek_graph_teacher_merge(scored, teacher_scored)
+                deepseek_graph_teacher_payload = dict(scored.get("deepseek_graph_model", {}) or deepseek_graph_teacher_payload)
+                memory_router_decision = _memory_router_decision(
+                    scored,
+                    mode=self.memory_router_mode,
+                    threshold=self.memory_router_threshold,
+                    margin=self.memory_router_margin,
+                )
+            elif deepseek_graph_teacher_mode == "replace":
+                fail_closed = _normalize(os.getenv("TMCRA_DEEPSEEK_GRAPH_MODEL_FAIL_CLOSED", "on")) not in {
+                    "off",
+                    "none",
+                    "false",
+                    "0",
+                    "fallback",
+                    "allow_fallback",
+                }
+                if fail_closed:
+                    status = _clean_text(deepseek_graph_teacher_payload.get("status", "")) or "missing_scores"
+                    detail = _clean_text(
+                        deepseek_graph_teacher_payload.get("error", "")
+                        or deepseek_graph_teacher_payload.get("raw_preview", "")
+                        or deepseek_graph_teacher_payload.get("finish_reason", "")
+                    )
+                    raise RuntimeError(
+                        f"DeepSeek graph teacher replace failed without usable graph scores: status={status}; detail={detail[:260]}"
+                    )
+                if deepseek_graph_teacher_payload:
+                    scored = dict(scored)
+                    scored["deepseek_graph_model"] = dict(deepseek_graph_teacher_payload)
+            elif deepseek_graph_teacher_payload:
+                scored = dict(scored)
+                scored["deepseek_graph_model"] = dict(deepseek_graph_teacher_payload)
+        _hybrid_mark("graph_teacher_sec")
         recall_event_scores = dict(scored.get("recall_event_scores", {}) or {})
         rerank_candidate_event_ids = list(scored.get("rerank_candidate_event_ids", []) or [])
         base_event_scores = dict(scored.get("base_event_scores", {}) or {})
@@ -7487,9 +8601,15 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 base_path_scores[path_id] = max(float(base_path_scores.get(path_id, 0.0)), floor)
                 calibrated_path_scores[path_id] = max(float(calibrated_path_scores.get(path_id, 0.0)), floor)
                 path_model_scores[path_id] = max(float(path_model_scores.get(path_id, 0.0)), floor)
+        _hybrid_mark("score_postprocess_sec")
         selection_consistency_repaired = False
         selection_consistency_reason = ""
         model_focused_answer_type = _clean_text(focused_answer_type_from_model)
+        focused_answer_type = _reconciled_focused_answer_type(
+            question_analysis,
+            answer_type_scores,
+            focused_answer_type_from_model,
+        )
         embedder_fusion_selected_event_ids: List[str] = []
         embedder_fusion_selected_path_ids: List[str] = []
         if decision_fusion_enabled and (selected_path_ids_from_model or selected_event_ids_from_model):
@@ -7507,7 +8627,6 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                         key=lambda item: (-float(item[1]), item[0]),
                     )
                 ][:base_selected_path_limit]
-            focused_answer_type = _reconciled_focused_answer_type(question_analysis, answer_type_scores, focused_answer_type_from_model)
             tunnel_rescue_path_ids: List[str] = []
             tunnel_rescue_pre_filter_path_ids: List[str] = []
             path_utility_direct_support_path_ids: List[str] = []
@@ -7623,6 +8742,12 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                         key=lambda item: (-float(item[1]), item[0]),
                     )
                 ][: max(1, min(self.candidate_event_k, max(top_k, _HYBRID_SELECTED_EVENT_FLOOR)))]
+            selected_event_ids = _add_multi_evidence_recall_coverage(
+                selected_event_ids,
+                recall_event_ids,
+                focused_answer_type=focused_answer_type,
+                top_k=top_k,
+            )
             repaired_path_ids, selection_consistency_repaired, selection_consistency_reason = _repair_selected_paths_for_focus(
                 selected_path_ids,
                 runtime_paths=runtime_paths,
@@ -7653,6 +8778,12 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 )
                 if answer_plan_ranked_event_ids:
                     selected_event_ids = _dedupe([*selected_event_ids, *answer_plan_ranked_event_ids])
+                selected_event_ids = _add_multi_evidence_recall_coverage(
+                    selected_event_ids,
+                    recall_event_ids,
+                    focused_answer_type=focused_answer_type,
+                    top_k=top_k,
+                )
             if profile_first_event_ids:
                 selected_event_ids = _dedupe([*profile_first_event_ids, *selected_event_ids])
             if embedder_fusion_applied_event_scores and self.embedder_fusion_select_k > 0:
@@ -7690,6 +8821,12 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 embedder_fusion_selected_event_ids = list(ranked_fusion_event_ids)
             if answer_plan_ranked_event_ids:
                 selected_event_ids = _dedupe([*selected_event_ids, *answer_plan_ranked_event_ids])
+            selected_event_ids = _add_multi_evidence_recall_coverage(
+                selected_event_ids,
+                recall_event_ids,
+                focused_answer_type=focused_answer_type,
+                top_k=top_k,
+            )
             final_hits: List[MemoryHit] = []
             seen_memory_ids = set()
             selected_event_id_set = set(selected_event_ids)
@@ -7700,9 +8837,10 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                     continue
                 path_type = _clean_text(path.get("type", ""))
                 support_node_id = _path_support_node_id(path)
+                event_hit_candidates = [*grouped_hits.get(event_id, []), *_event_record_hits_from_graph(self.graph, event_id)]
                 support_hit = _support_hit_for_path(path_type, grouped_hits.get(event_id, []))
                 event_hit = _representative_event_hit(
-                    [*grouped_hits.get(event_id, []), *_event_record_hits_from_graph(self.graph, event_id)],
+                    event_hit_candidates,
                     query=query,
                 )
                 decision_score = round(float(path_scores.get(path_id, 0.0)), 6)
@@ -7922,12 +9060,15 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             final_hits = _coverage_preserving_final_hits(final_hits, selected_event_ids=selected_event_ids, top_k=top_k)
             final_hit_event_ids = _event_ids_from_hits(final_hits)
             final_missing_selected_event_ids = [event_id for event_id in selected_event_ids if event_id not in set(final_hit_event_ids)]
+            _hybrid_mark("selection_materialization_sec")
             return {
                 "hits": final_hits,
+                "_grouped_hits": grouped_hits,
                 "metadata": {
                     "retrieval_mode": "hybrid_node_scored",
                     "hybrid_enabled": True,
                     "hybrid_source": hybrid_source,
+                    "deepseek_graph_model": dict(deepseek_graph_teacher_payload),
                     **memory_router_decision,
                     "profile_first_router_suppressed": bool(profile_first_router_suppressed),
                     "recall_event_ids": list(recall_event_ids),
@@ -7953,6 +9094,9 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                     "hybrid_candidate_event_ids": list(hybrid_candidate_event_ids),
                     "hybrid_candidate_union_enabled": True,
                     "hybrid_candidate_union_rescored": bool(hybrid_candidate_union_rescored),
+                    "runtime_graph_cache_hit": bool(runtime_graph_cache_hit),
+                    "node_runtime_profile": dict(scored.get("runtime_profile", {}) or {}),
+                    "hybrid_runtime_profile": _hybrid_profile_payload(),
                     "hybrid_candidate_union_added_event_ids": list(hybrid_candidate_union_added_event_ids),
                     "hybrid_candidate_union_priority_changed": bool(hybrid_candidate_union_priority_changed),
                     "rerank_candidate_event_ids": list(rerank_candidate_event_ids),
@@ -8119,6 +9263,12 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             selected_event_ids = _dedupe([*profile_first_event_ids, *selected_event_ids])
         if answer_plan_ranked_event_ids:
             selected_event_ids = _dedupe([*selected_event_ids, *answer_plan_ranked_event_ids])
+        selected_event_ids = _add_multi_evidence_recall_coverage(
+            selected_event_ids,
+            recall_event_ids,
+            focused_answer_type=focused_answer_type,
+            top_k=top_k,
+        )
         selected_event_id_set = set(selected_event_ids)
         ranked_path_ids = [
             path_id
@@ -8151,9 +9301,10 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             event_id = _clean_text(path.get("event_id", ""))
             support_node_id = _path_support_node_id(path)
             path_type = _clean_text(path.get("type", ""))
+            event_hit_candidates = [*grouped_hits.get(event_id, []), *_event_record_hits_from_graph(self.graph, event_id)]
             support_hit = _support_hit_for_path(path_type, grouped_hits.get(event_id, []))
             event_hit = _representative_event_hit(
-                [*grouped_hits.get(event_id, []), *_event_record_hits_from_graph(self.graph, event_id)],
+                event_hit_candidates,
                 query=query,
             )
             hit_pairs: List[tuple[MemoryHit | None, float]] = [(support_hit, path_scores.get(path_id, 0.0))]
@@ -8338,12 +9489,15 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         final_hits = _coverage_preserving_final_hits(final_hits, selected_event_ids=selected_event_ids, top_k=top_k)
         final_hit_event_ids = _event_ids_from_hits(final_hits)
         final_missing_selected_event_ids = [event_id for event_id in selected_event_ids if event_id not in set(final_hit_event_ids)]
+        _hybrid_mark("selection_materialization_sec")
         return {
             "hits": final_hits,
+            "_grouped_hits": grouped_hits,
             "metadata": {
                 "retrieval_mode": "hybrid_node_scored",
                 "hybrid_enabled": True,
                 "hybrid_source": hybrid_source,
+                "deepseek_graph_model": dict(deepseek_graph_teacher_payload),
                 **memory_router_decision,
                 "profile_first_router_suppressed": bool(profile_first_router_suppressed),
                 "recall_event_ids": list(recall_event_ids),
@@ -8369,6 +9523,9 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 "hybrid_candidate_event_ids": list(hybrid_candidate_event_ids),
                 "hybrid_candidate_union_enabled": True,
                 "hybrid_candidate_union_rescored": bool(hybrid_candidate_union_rescored),
+                "runtime_graph_cache_hit": bool(runtime_graph_cache_hit),
+                "node_runtime_profile": dict(scored.get("runtime_profile", {}) or {}),
+                "hybrid_runtime_profile": _hybrid_profile_payload(),
                 "hybrid_candidate_union_added_event_ids": list(hybrid_candidate_union_added_event_ids),
                 "hybrid_candidate_union_priority_changed": bool(hybrid_candidate_union_priority_changed),
                 "rerank_candidate_event_ids": list(rerank_candidate_event_ids),
@@ -8442,11 +9599,15 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             },
         }
 
+    @_serialized_adapter_call
     def retrieve(self, query: str, *, top_k: int = 6) -> MemoryRetrieval:
+        call_started = time.perf_counter()
         self._reload_graph()
+        reload_finished = time.perf_counter()
         start = time.perf_counter()
         candidate_top_k = max(top_k, self.candidate_event_k if self.retrieval_mode == "hybrid_node_scored" else min(max(top_k, 18), 48))
         payload = self.graph.retrieve(query, top_k=candidate_top_k)
+        heuristic_finished = time.perf_counter()
         hits = [_raw_hit_to_memory_hit(item) for item in payload.get("hits", []) or []]
         scored_lookup = {hit.memory_id: hit for hit in hits if hit.memory_id}
         active_hits = _restore_hit_scores([_raw_hit_to_memory_hit(item) for item in payload.get("active_hits", []) or []], scored_lookup)
@@ -8455,8 +9616,28 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         overwrite_hits = _restore_hit_scores([_raw_hit_to_memory_hit(item) for item in payload.get("overwrite_hits", []) or []], scored_lookup)
         false_hits = _restore_hit_scores([_raw_hit_to_memory_hit(item) for item in payload.get("false_hits", []) or []], scored_lookup)
         public_hits = _public_graph_hits(self.graph) if self.retrieval_mode == "hybrid_node_scored" else []
+        hit_prepare_finished = time.perf_counter()
         hybrid_payload = self._hybrid_node_scored_hits(query, hits, top_k=top_k, public_hits=public_hits)
+        hybrid_finished = time.perf_counter()
+        adapter_stage_profile_enabled = _normalize(os.getenv("TMCRA_ADAPTER_STAGE_PROFILE", "")) in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        adapter_stage_profile: Dict[str, float] = {}
+        adapter_stage_last = hybrid_finished
+
+        def _adapter_stage_mark(name: str) -> None:
+            nonlocal adapter_stage_last
+            if not adapter_stage_profile_enabled:
+                return
+            now = time.perf_counter()
+            adapter_stage_profile[name] = round(now - adapter_stage_last, 6)
+            adapter_stage_last = now
+
         hits = list(hybrid_payload.get("hits", []) or hits)
+        hybrid_grouped_hits = dict(hybrid_payload.get("_grouped_hits", {}) or {})
         hybrid_metadata = dict(hybrid_payload.get("metadata", {}) or {})
         memory_router_decision = _memory_router_decision(
             hybrid_metadata,
@@ -8464,6 +9645,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             threshold=self.memory_router_threshold,
             margin=self.memory_router_margin,
         )
+        _adapter_stage_mark("router_decision_sec")
         current_subject_payload = _current_subject_protected_hits(
             query=query,
             graph=self.graph,
@@ -8472,6 +9654,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         )
         hits = list(current_subject_payload.get("hits", hits) or hits)
         current_subject_metadata = dict(current_subject_payload.get("metadata", {}) or {})
+        _adapter_stage_mark("current_subject_sec")
         audit_anchor_payload = _audit_anchor_protected_hits(
             query=query,
             final_hits=hits,
@@ -8481,6 +9664,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         )
         hits = list(audit_anchor_payload.get("hits", hits) or hits)
         audit_anchor_metadata = dict(audit_anchor_payload.get("metadata", {}) or {})
+        _adapter_stage_mark("audit_anchor_sec")
         identifier_payload = _identifier_protected_hits(
             query=query,
             final_hits=hits,
@@ -8489,6 +9673,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         )
         hits = list(identifier_payload.get("hits", hits) or hits)
         identifier_metadata = dict(identifier_payload.get("metadata", {}) or {})
+        _adapter_stage_mark("identifier_sec")
         if _memory_router_allows(memory_router_decision, "path_tunnel", "topic_tunnel"):
             depth_chain_payload = _depth_chain_protected_hits(
                 query=query,
@@ -8503,12 +9688,14 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 "depth_chain_protected_enabled": False,
                 "depth_chain_router_suppressed": True,
             }
+        _adapter_stage_mark("depth_chain_sec")
         if _memory_router_allows(memory_router_decision, "profile", "resource"):
             profile_focused_payload = _profile_focused_pack_hits(
                 self.graph,
                 query,
                 hits,
                 top_k=top_k,
+                grouped_hits=hybrid_grouped_hits,
             )
             hits = list(profile_focused_payload.get("hits", hits) or hits)
             profile_focused_metadata = dict(profile_focused_payload.get("metadata", {}) or {})
@@ -8517,6 +9704,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 "profile_focused_pack_enabled": False,
                 "profile_focused_router_suppressed": True,
             }
+        _adapter_stage_mark("profile_focused_sec")
         if _memory_router_allows(memory_router_decision, "topic_tunnel"):
             topic_bucket_payload = _topic_bucket_rerank_hits(self.graph, query, hits, top_k=top_k)
             topic_bucket_hits = topic_bucket_payload.get("hits", hits)
@@ -8527,6 +9715,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 "topic_bucket_rerank_enabled": False,
                 "topic_bucket_router_suppressed": True,
             }
+        _adapter_stage_mark("topic_bucket_sec")
         temporal_runtime_payload = self._temporal_runtime_pack(query)
         temporal_evidence_payload = self._apply_temporal_evidence_pack_to_hits(
             hits,
@@ -8535,9 +9724,11 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         )
         hits = list(temporal_evidence_payload.get("hits", hits) or hits)
         temporal_runtime_metadata = dict(temporal_evidence_payload.get("metadata", {}) or {})
+        _adapter_stage_mark("temporal_pack_sec")
         injection_planner_payload = self._apply_injection_planner_to_hits(query, hits, top_k=top_k)
         hits = list(injection_planner_payload.get("hits", hits) or hits)
         injection_planner_metadata = dict(injection_planner_payload.get("metadata", {}) or {})
+        _adapter_stage_mark("injection_planner_sec")
         facet_query_pack_payload = _facet_query_pack_hits(
             self.graph,
             query,
@@ -8546,6 +9737,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
         )
         hits = list(facet_query_pack_payload.get("hits", hits) or hits)
         facet_query_pack_metadata = dict(facet_query_pack_payload.get("metadata", {}) or {})
+        _adapter_stage_mark("facet_query_pack_sec")
         unit_coverage_mode = _normalize(os.getenv("TMCRA_UNIT_COVERAGE_PACK_MODE", "on"))
         if unit_coverage_mode in _MULTI_UNIT_CHAIN_DISABLED_MODES:
             unit_coverage_metadata = {
@@ -8561,6 +9753,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             )
             hits = list(unit_coverage_payload.get("hits", hits) or hits)
             unit_coverage_metadata = dict(unit_coverage_payload.get("metadata", {}) or {})
+        _adapter_stage_mark("unit_coverage_sec")
         if _normalize(os.getenv("TMCRA_MULTI_UNIT_CHAIN_SLOT_MODE", "on")) not in _MULTI_UNIT_CHAIN_DISABLED_MODES:
             multi_unit_chain_slot_payload = _multi_unit_chain_slot_hits(
                 self.graph,
@@ -8575,6 +9768,7 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 "multi_unit_chain_slot_enabled": False,
                 "multi_unit_chain_slot_reason": "disabled",
             }
+        _adapter_stage_mark("multi_unit_chain_slot_sec")
         profile_protected_reinserted_count = 0
         profile_protected_ids = _dedupe(
             [
@@ -8664,6 +9858,8 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             )
             embedder_fusion_output_reordered = before_order != _event_ids_from_hits(hits)
         retrieval_context_tokens = int(payload.get("context_token_estimate", _estimate_tokens_from_hits(hits)))
+        _adapter_stage_mark("final_protection_and_tokens_sec")
+        postprocess_finished = time.perf_counter()
         self._last_retrieval_context_tokens = retrieval_context_tokens
         result = MemoryRetrieval(
             concepts=list(payload.get("concepts", []) or []),
@@ -8698,9 +9894,24 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
                 "embedder_fusion_output_reordered": bool(embedder_fusion_output_reordered),
             },
         )
-        self._persist_graph()
+        persisted_retrieval = self._persist_latest_audit("retrieval_log")
+        audit_finished = time.perf_counter()
+        result.metadata["query_id"] = persisted_retrieval.get(
+            "query_id", result.metadata.get("query_id", "")
+        )
+        result.metadata["adapter_runtime_profile"] = {
+            "reload_graph_sec": round(reload_finished - call_started, 6),
+            "heuristic_retrieve_sec": round(heuristic_finished - reload_finished, 6),
+            "hit_prepare_sec": round(hit_prepare_finished - heuristic_finished, 6),
+            "hybrid_graph_sec": round(hybrid_finished - hit_prepare_finished, 6),
+            "postprocess_sec": round(postprocess_finished - hybrid_finished, 6),
+            "audit_persist_sec": round(audit_finished - postprocess_finished, 6),
+            "total_sec": round(audit_finished - call_started, 6),
+            "postprocess_stages": dict(adapter_stage_profile),
+        }
         return result
 
+    @_serialized_adapter_call
     def export_dialog_graph(self, *, mode: str = "light") -> Dict[str, Any]:
         self._reload_graph()
         return self.graph.export_graph(
@@ -8708,19 +9919,23 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             mode=mode,
         )
 
+    @_serialized_adapter_call
     def export_dialog_graph_mermaid(self) -> str:
         self._reload_graph()
         return self.graph.export_mermaid()
 
+    @_serialized_adapter_call
     def register_answer_support(self, *, answer_id: str, memory_ids: List[str], query_id: str = "", answer_text: str = "") -> None:
         self._reload_graph()
         self.graph.register_answer_support(answer_id=answer_id, memory_ids=memory_ids, query_id=query_id, answer_text=answer_text)
-        self._persist_graph()
+        self._persist_latest_audit("answer_support_log")
 
+    @_serialized_adapter_call
     def telemetry_snapshot(self) -> Dict[str, Any]:
         self._reload_graph()
         return self.graph.summary()
 
+    @_serialized_adapter_call
     def stats(self) -> Dict[str, Any]:
         self._reload_graph()
         storage = self._storage_breakdown()
@@ -8736,10 +9951,12 @@ class GraphSessionMemoryAdapter(MemoryAdapter):
             **self.graph.summary(),
         )
 
+    @_serialized_adapter_call
     def storage_bytes(self) -> int:
         self._reload_graph()
         return self._storage_breakdown()["storage_bytes"]
 
+    @_serialized_adapter_call
     def build_prompt_context(self, query: str, *, top_k: int = 8) -> Dict[str, Any]:
         retrieval = self.retrieve(query, top_k=top_k)
         retrieval_payload = retrieval.to_dict()

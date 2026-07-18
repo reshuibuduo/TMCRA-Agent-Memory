@@ -1,0 +1,39 @@
+name: Benchmark package CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-validation:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: benchmarks/longmemeval
+    steps:
+      - name: Check out source without LFS weights
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: benchmarks/longmemeval/requirements.txt
+
+      - name: Install offline test dependency
+        run: python -m pip install pytest==9.0.2
+
+      - name: Compile Python sources
+        run: python -m compileall -q src scripts tests
+
+      - name: Check shell scripts
+        run: bash -n scripts/reproduce_smoke.sh scripts/reproduce_s500.sh
+
+      - name: Run offline tests
+        run: python -m pytest

@@ -1,0 +1,16 @@
+{
+  "schema_version": "tmcra.benchmark-result.1",
+  "benchmark": "LongMemEval",
+  "metric": "accuracy",
+  "score_percent": 82.2,
+  "correct": 411,
+  "total": 500,
+  "by_question_type": {
+    "knowledge-update": {"correct": 71, "total": 78, "score_percent": 91.0},
+    "multi-session": {"correct": 90, "total": 133, "score_percent": 67.7},
+    "single-session-assistant": {"correct": 55, "total": 56, "score_percent": 98.2},
+    "single-session-preference": {"correct": 27, "total": 30, "score_percent": 90.0},
+    "single-session-user": {"correct": 67, "total": 70, "score_percent": 95.7},
+    "temporal-reasoning": {"correct": 101, "total": 133, "score_percent": 75.9}
+  }
+}

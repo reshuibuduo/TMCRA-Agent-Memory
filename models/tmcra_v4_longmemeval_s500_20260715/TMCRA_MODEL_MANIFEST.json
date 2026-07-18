@@ -1,0 +1,35 @@
+{
+  "schema_version": "tmcra.model-release.1",
+  "release": "tmcra_v4_longmemeval_s500_20260715",
+  "license": "Apache-2.0",
+  "safe_loading": {
+    "format": "pytorch_checkpoint",
+    "required_torch_load_argument": "weights_only=True",
+    "allow_pickle_fallback": false
+  },
+  "files": [
+    {
+      "name": "node_scorer.pt",
+      "bytes": 207356243,
+      "sha256": "d2318aafb07f9a15a1d95e6eac1b3e09afa07c570dd9d15d3f75544c9950f201",
+      "public_inference_keys": ["config", "state_dict"]
+    },
+    {
+      "name": "path_scorer.pt",
+      "bytes": 207356243,
+      "sha256": "ecdc2bca51b7646a8a56c7db9cea4aeec581e64c3b61e6e06f7e9fa2a93b3bf5",
+      "public_inference_keys": ["config", "state_dict"]
+    },
+    {
+      "name": "tmcra_v3_reranker.pt",
+      "bytes": 4232213,
+      "sha256": "09a285b484ca857b24b53ad19d5998302f16d224ca9e4fd73a4eb5a52f022942",
+      "public_inference_keys": [
+        "schema_version",
+        "channel_names",
+        "model_config",
+        "model_state"
+      ]
+    }
+  ]
+}

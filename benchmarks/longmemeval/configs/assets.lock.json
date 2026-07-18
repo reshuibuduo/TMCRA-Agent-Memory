@@ -1,0 +1,51 @@
+{
+  "schema_version": "tmcra.benchmark-assets.1",
+  "files": [
+    {
+      "id": "longmemeval_s_cleaned",
+      "kind": "dataset",
+      "destination": "data/longmemeval_s_cleaned.json",
+      "url": "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json",
+      "bytes": 277383467,
+      "sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
+    },
+    {
+      "id": "tmcra_node_scorer",
+      "kind": "checkpoint",
+      "storage": "git_lfs",
+      "destination": "../../models/tmcra_v4_longmemeval_s500_20260715/node_scorer.pt",
+      "bytes": 207356243,
+      "sha256": "d2318aafb07f9a15a1d95e6eac1b3e09afa07c570dd9d15d3f75544c9950f201"
+    },
+    {
+      "id": "tmcra_path_scorer",
+      "kind": "checkpoint",
+      "storage": "git_lfs",
+      "destination": "../../models/tmcra_v4_longmemeval_s500_20260715/path_scorer.pt",
+      "bytes": 207356243,
+      "sha256": "ecdc2bca51b7646a8a56c7db9cea4aeec581e64c3b61e6e06f7e9fa2a93b3bf5"
+    },
+    {
+      "id": "tmcra_v3_reranker",
+      "kind": "checkpoint",
+      "storage": "git_lfs",
+      "destination": "../../models/tmcra_v4_longmemeval_s500_20260715/tmcra_v3_reranker.pt",
+      "bytes": 4232213,
+      "sha256": "09a285b484ca857b24b53ad19d5998302f16d224ca9e4fd73a4eb5a52f022942"
+    }
+  ],
+  "huggingface_models": [
+    {
+      "id": "bge_m3",
+      "repo_id": "BAAI/bge-m3",
+      "revision": "5617a9f61b028005a4858fdac845db406aefb181",
+      "destination": "models/BAAI/bge-m3"
+    },
+    {
+      "id": "bge_reranker_v2_m3",
+      "repo_id": "BAAI/bge-reranker-v2-m3",
+      "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+      "destination": "models/BAAI/bge-reranker-v2-m3"
+    }
+  ]
+}
