@@ -1,0 +1,382 @@
+{
+  "benchmark": {
+    "abstention_count": 30,
+    "dataset_variant": "longmemeval_s_cleaned",
+    "name": "LongMemEval-S",
+    "official_retrieval_scored_count": 470,
+    "question_count": 500,
+    "reference_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
+  },
+  "end_to_end": {
+    "answer_attempts_used_histogram": {
+      "1": 485,
+      "2": 14,
+      "3": 1
+    },
+    "answer_model": {
+      "gpt-5.4": 500
+    },
+    "answer_protocol": {
+      "evidence_operation_bound_v5": 500
+    },
+    "by_mutually_exclusive_type_with_abstention_separated": {
+      "abstention": {
+        "accuracy": 0.9,
+        "correct": 27,
+        "total": 30
+      },
+      "knowledge-update": {
+        "accuracy": 0.9166666666666666,
+        "correct": 66,
+        "total": 72
+      },
+      "multi-session": {
+        "accuracy": 0.6611570247933884,
+        "correct": 80,
+        "total": 121
+      },
+      "single-session-assistant": {
+        "accuracy": 0.9821428571428571,
+        "correct": 55,
+        "total": 56
+      },
+      "single-session-preference": {
+        "accuracy": 0.9,
+        "correct": 27,
+        "total": 30
+      },
+      "single-session-user": {
+        "accuracy": 0.953125,
+        "correct": 61,
+        "total": 64
+      },
+      "temporal-reasoning": {
+        "accuracy": 0.7480314960629921,
+        "correct": 95,
+        "total": 127
+      }
+    },
+    "by_official_question_type_including_abstention_rows": {
+      "knowledge-update": {
+        "accuracy": 0.9102564102564102,
+        "correct": 71,
+        "total": 78
+      },
+      "multi-session": {
+        "accuracy": 0.6766917293233082,
+        "correct": 90,
+        "total": 133
+      },
+      "single-session-assistant": {
+        "accuracy": 0.9821428571428571,
+        "correct": 55,
+        "total": 56
+      },
+      "single-session-preference": {
+        "accuracy": 0.9,
+        "correct": 27,
+        "total": 30
+      },
+      "single-session-user": {
+        "accuracy": 0.9571428571428572,
+        "correct": 67,
+        "total": 70
+      },
+      "temporal-reasoning": {
+        "accuracy": 0.7593984962406015,
+        "correct": 101,
+        "total": 133
+      }
+    },
+    "judge_model": {
+      "gpt-4o-2024-08-06": 500
+    },
+    "judge_retry_disclosure": {
+      "initial_empty_response_count": 4,
+      "policy": "Only empty first-attempt judge responses were retried.",
+      "retry_physical_calls": 4
+    },
+    "overall": {
+      "accuracy": 0.822,
+      "correct": 411,
+      "total": 500
+    }
+  },
+  "frozen_input_sha256": {
+    "longmemeval_s_cleaned.json": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+    "o100_debug.jsonl": "87eb32ad28bed6999ec53436c5c021dced969b442940f23c54dec97c601eaa2c",
+    "official_judge_500.jsonl": "671cfef6fe161dcbb89c6dfb09b798a0581e91ef6ad1134e8fb9e3626243fb9a",
+    "r400_debug.jsonl": "cef9dcde806f6f38b7a152ef4ebe19c29a6e4ad23ba183f9911c5c18bcea1f1f"
+  },
+  "retrieval": {
+    "abstention_30_diagnostic": {
+      "answer_facing_evidence_sessions": {
+        "top_8": {
+          "any_hit": {
+            "count": 29,
+            "rate": 0.9666666666666667
+          },
+          "complete_coverage": {
+            "count": 23,
+            "rate": 0.7666666666666667
+          },
+          "macro_session_recall": {
+            "exact_fraction": "79/90",
+            "rate": 0.8777777777777778
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 49,
+            "rate": 0.8448275862068966,
+            "required_gold_sessions": 58
+          },
+          "question_count": 30
+        }
+      },
+      "source_candidate_chunks": {
+        "top_24": {
+          "any_hit": {
+            "count": 30,
+            "rate": 1.0
+          },
+          "complete_coverage": {
+            "count": 29,
+            "rate": 0.9666666666666667
+          },
+          "macro_session_recall": {
+            "exact_fraction": "59/60",
+            "rate": 0.9833333333333333
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 57,
+            "rate": 0.9827586206896551,
+            "required_gold_sessions": 58
+          },
+          "question_count": 30
+        },
+        "top_5": {
+          "any_hit": {
+            "count": 29,
+            "rate": 0.9666666666666667
+          },
+          "complete_coverage": {
+            "count": 18,
+            "rate": 0.6
+          },
+          "macro_session_recall": {
+            "exact_fraction": "143/180",
+            "rate": 0.7944444444444444
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 44,
+            "rate": 0.7586206896551724,
+            "required_gold_sessions": 58
+          },
+          "question_count": 30
+        },
+        "top_8": {
+          "any_hit": {
+            "count": 30,
+            "rate": 1.0
+          },
+          "complete_coverage": {
+            "count": 22,
+            "rate": 0.7333333333333333
+          },
+          "macro_session_recall": {
+            "exact_fraction": "79/90",
+            "rate": 0.8777777777777778
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 49,
+            "rate": 0.8448275862068966,
+            "required_gold_sessions": 58
+          },
+          "question_count": 30
+        }
+      }
+    },
+    "answer_or_judge_labels_used_to_rank_or_score_retrieval": false,
+    "definitions": {
+      "answer_facing_top_8": "The up-to-eight unique session windows bound to the immutable evidence packet sent to GPT-5.4.",
+      "any_hit": "At least one required answer_session_id is present.",
+      "complete_coverage": "Every required answer_session_id is present.",
+      "macro_session_recall": "Question-level mean of covered required sessions divided by required sessions.",
+      "micro_session_recall": "Covered required sessions divided by all required sessions.",
+      "source_candidate_top_k": "The first K ranked Source candidate chunks, evaluated using their session_id; repeated sessions may occupy multiple slots."
+    },
+    "full_500_diagnostic": {
+      "answer_facing_evidence_sessions": {
+        "top_8": {
+          "any_hit": {
+            "count": 499,
+            "rate": 0.998
+          },
+          "complete_coverage": {
+            "count": 439,
+            "rate": 0.878
+          },
+          "macro_session_recall": {
+            "exact_fraction": "14297/15000",
+            "rate": 0.9531333333333334
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 871,
+            "rate": 0.9187763713080169,
+            "required_gold_sessions": 948
+          },
+          "question_count": 500
+        }
+      },
+      "source_candidate_chunks": {
+        "top_24": {
+          "any_hit": {
+            "count": 500,
+            "rate": 1.0
+          },
+          "complete_coverage": {
+            "count": 489,
+            "rate": 0.978
+          },
+          "macro_session_recall": {
+            "exact_fraction": "5951/6000",
+            "rate": 0.9918333333333333
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 935,
+            "rate": 0.9862869198312236,
+            "required_gold_sessions": 948
+          },
+          "question_count": 500
+        },
+        "top_5": {
+          "any_hit": {
+            "count": 497,
+            "rate": 0.994
+          },
+          "complete_coverage": {
+            "count": 408,
+            "rate": 0.816
+          },
+          "macro_session_recall": {
+            "exact_fraction": "137/150",
+            "rate": 0.9133333333333333
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 815,
+            "rate": 0.859704641350211,
+            "required_gold_sessions": 948
+          },
+          "question_count": 500
+        },
+        "top_8": {
+          "any_hit": {
+            "count": 498,
+            "rate": 0.996
+          },
+          "complete_coverage": {
+            "count": 445,
+            "rate": 0.89
+          },
+          "macro_session_recall": {
+            "exact_fraction": "28553/30000",
+            "rate": 0.9517666666666666
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 872,
+            "rate": 0.919831223628692,
+            "required_gold_sessions": 948
+          },
+          "question_count": 500
+        }
+      }
+    },
+    "official_non_abstention_470": {
+      "answer_facing_evidence_sessions": {
+        "top_8": {
+          "any_hit": {
+            "count": 470,
+            "rate": 1.0
+          },
+          "complete_coverage": {
+            "count": 416,
+            "rate": 0.8851063829787233
+          },
+          "macro_session_recall": {
+            "exact_fraction": "13507/14100",
+            "rate": 0.9579432624113475
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 822,
+            "rate": 0.9235955056179775,
+            "required_gold_sessions": 890
+          },
+          "question_count": 470
+        }
+      },
+      "source_candidate_chunks": {
+        "top_24": {
+          "any_hit": {
+            "count": 470,
+            "rate": 1.0
+          },
+          "complete_coverage": {
+            "count": 460,
+            "rate": 0.9787234042553191
+          },
+          "macro_session_recall": {
+            "exact_fraction": "5597/5640",
+            "rate": 0.9923758865248227
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 878,
+            "rate": 0.9865168539325843,
+            "required_gold_sessions": 890
+          },
+          "question_count": 470
+        },
+        "top_5": {
+          "any_hit": {
+            "count": 468,
+            "rate": 0.9957446808510638
+          },
+          "complete_coverage": {
+            "count": 390,
+            "rate": 0.8297872340425532
+          },
+          "macro_session_recall": {
+            "exact_fraction": "2597/2820",
+            "rate": 0.9209219858156028
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 771,
+            "rate": 0.8662921348314607,
+            "required_gold_sessions": 890
+          },
+          "question_count": 470
+        },
+        "top_8": {
+          "any_hit": {
+            "count": 468,
+            "rate": 0.9957446808510638
+          },
+          "complete_coverage": {
+            "count": 423,
+            "rate": 0.9
+          },
+          "macro_session_recall": {
+            "exact_fraction": "8991/9400",
+            "rate": 0.9564893617021276
+          },
+          "micro_session_recall": {
+            "covered_gold_sessions": 823,
+            "rate": 0.9247191011235955,
+            "required_gold_sessions": 890
+          },
+          "question_count": 470
+        }
+      }
+    }
+  },
+  "schema_version": "tmcra.longmemeval-s.github-submission-artifacts.v1",
+  "status": "frozen_complete"
+}
