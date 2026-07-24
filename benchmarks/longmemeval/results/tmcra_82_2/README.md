@@ -49,8 +49,6 @@ definitions and complete results are recorded in `metrics_for_submission.json`.
 - This is one persisted full-500 evaluation run. An API balance interruption
   paused the run; it was resumed from persisted state, and already successful
   questions were not replayed.
-- Four judge requests returned empty transport responses. Only those four
-  missing terminal labels were retried; no completed judge label was resampled.
 - The score and published artifacts are frozen. This run used answer protocol
   v5. The current public harness uses v6, so a new run may differ without
   changing the frozen 411/500 result reported here.
