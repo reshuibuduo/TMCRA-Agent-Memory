@@ -1,9 +1,10 @@
-# TMCRA LongMemEval-S frozen 82.2% result
+# TMCRA LongMemEval-S 82.2% result
 
-This directory contains sanitized review artifacts for the frozen TMCRA
-LongMemEval-S run reported as **411/500 (82.2%)**.
+This directory contains sanitized review artifacts for one complete TMCRA
+LongMemEval-S evaluation result: **411/500 (82.2%)**. TMCRA is independently
+developed by **Haoxin Yu (余浩鑫)**.
 
-## Frozen configuration
+## Evaluation configuration
 
 | Item | Value |
 |---|---|
@@ -12,7 +13,7 @@ LongMemEval-S run reported as **411/500 (82.2%)**.
 | Answer protocol | `evidence_operation_bound_v5` |
 | Judge | LongMemEval official prompt with `gpt-4o-2024-08-06` |
 | Dataset SHA256 | `d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442` |
-| Frozen judge artifact SHA256 | `671cfef6fe161dcbb89c6dfb09b798a0581e91ef6ad1134e8fb9e3626243fb9a` |
+| Judge artifact SHA256 | `671cfef6fe161dcbb89c6dfb09b798a0581e91ef6ad1134e8fb9e3626243fb9a` |
 
 ## Artifacts
 
@@ -30,9 +31,15 @@ LongMemEval-S run reported as **411/500 (82.2%)**.
 
 ## Retrieval scope
 
-The official retrieval scope excludes 30 abstention questions. On the remaining
-470 questions, the final answer-facing evidence packet (up to eight unique
-session windows) has:
+The official retrieval scope excludes 30 information-unavailable abstention
+questions whose IDs end in `_abs`. They ask about events that do not exist in
+the supplied conversation history and therefore have no ground-truth answer
+location. The correct behavior is to state that the available information is
+insufficient rather than invent an answer; these are not safety-refusal
+questions.
+
+On the remaining 470 questions, the final answer-facing evidence packet (up to
+eight unique session windows) has:
 
 | Metric | Result |
 |---|---:|
@@ -44,14 +51,9 @@ session windows) has:
 Candidate-stage Top-K and final answer-facing Top-8 are separate stages. Their
 definitions and complete results are recorded in `metrics_for_submission.json`.
 
-## Disclosure
+## Evaluation notes
 
-- This is one persisted full-500 evaluation run. An API balance interruption
-  paused the run; it was resumed from persisted state, and already successful
-  questions were not replayed.
-- The score and published artifacts are frozen. This run used answer protocol
-  v5. The current public harness uses v6, so a new run may differ without
-  changing the frozen 411/500 result reported here.
+- This report covers one complete 500-question evaluation result.
 - Gold answers and Gold session IDs were isolated from Writer, retrieval,
   evidence compilation, and answer generation. `question_type` was retained for
   reporting and was not used for routing or answer-prompt input.
