@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.zh-CN.md">简体中文</a></p>
 
-TMCRA gives long-running agents persistent, source-traceable memory across sessions and applications. A user prompt triggers recall from the owner-global and current-project scopes; after the answer, the user message and agent response are written as separate, attributed records.
+TMCRA gives long-running agents persistent, source-traceable memory across sessions and applications. A user prompt triggers recall from the owner-global and current-project scopes, followed by a USER source record; after the answer, a separate ASSISTANT source record is stored.
 
 This repository includes an owner-local runtime. Clone it, choose an OpenAI-compatible API endpoint or a local generation model, and run the complete memory service on `127.0.0.1`. No TMCRA account or production server is required.
 
@@ -58,19 +58,81 @@ Restart Codex, open `/hooks`, review the four local lifecycle commands, and gran
 
 The source release also contains a tested DeepSeek Harness technical preview plus shared Claude Code and ZCode hook manifests. See [Local tool integrations](docs/LOCAL_INTEGRATIONS.md) for the support matrix and exact acceptance evidence.
 
-## What runs locally
+## Feature guide
 
-- Source/Fast/Slow memory construction with immutable source evidence.
-- Separate user and agent authorship; one project scope plus an optional owner-global scope.
-- Cross-session and cross-application recall without merging unrelated projects.
-- Learned graph-node and path scoring with a local embedding index.
-- Evidence-window packing for injection into the next agent prompt.
-- Visual Atlas and Personal Knowledge projections.
-- Local token-usage ledger for the user's selected model provider.
-- Inspectable source messages plus message-level and project-level deletion.
-- Loopback-only FastAPI service with a generated local bearer token.
+| Capability | What the user gets |
+| --- | --- |
+| Automatic memory loop | Recall and USER-source write before the host runs, followed by a separate ASSISTANT-source write |
+| Cross-session and cross-application continuity | Tools working on the same project share progress without another project leaking into it |
+| Project isolation and owner-global memory | Project content remains partitioned; explicitly selected user context can be reused across projects |
+| Source / Fast / Slow layers | Inspectable source records plus derived memory for fast retrieval and deeper relationships |
+| Provenance-aware injection | Candidate memories, evidence windows, roles, sources, and retrieval traces for the next agent prompt |
+| Visual Atlas | A project/session/episode/evidence graph of personal memory |
+| Personal Knowledge | Evidence-cited learned, project, and personal knowledge pages |
+| Local models and BYOK | Run structured writing and knowledge curation through a local model or the user's OpenAI-compatible API |
+| Usage ledger | Provider, model, task, token, cache, and latency records with no TMCRA service charge |
+| Data control | Inspect source messages and delete one message or an entire project with grounded derivatives |
 
-The hosted account, subscription, billing, staff, tenant, production deployment, and operational control planes are intentionally excluded. The exact boundary is documented in [Public release boundary](docs/PUBLIC_RELEASE_BOUNDARY.md) and enforced by `scripts/audit_public_release.py`.
+### Automatic write and recall
+
+One complete turn is driven by host lifecycle events:
+
+1. Resolve a stable project identity from the current repository or working directory, then retry pending writes.
+2. Query both the owner-global and current-project scopes using the current user prompt.
+3. Rank and deduplicate candidates into role- and source-attributed `evidence_windows`, then produce injectable `prompt_evidence`.
+4. Persist the USER source before the host loop and the separate ASSISTANT source after completion. Retain the application, native thread, message ID, and actor metadata on both.
+5. Recall failures let the host continue by default. Failed writes enter an OS-user-private outbox and retry on the next lifecycle event.
+
+The recall response also includes candidate counts and timing per scope. Injected context carries an explicit trust boundary: memory evidence is data and cannot override system or user instructions.
+
+### Projects, sessions, and cross-tool continuity
+
+Project identity is resolved from `.tmcra/project.json`, Git origin, Git root, or the canonical working directory, in that order. Codex, DeepSeek Harness, and other adapters opened in the same repository share the `project:<id>` memory while preserving their own `source_app`, native thread, session, role, and agent identities.
+
+- `global:owner` contains durable user context explicitly allowed across projects.
+- `project:<id>` contains requirements, decisions, progress, problems, and agent work products.
+- `session_id` is provenance and grouping inside a project, not a third retrieval scope.
+- `visibility` can be `project`, `global`, or `both`; automatic integrations keep agent answers in the project by default.
+
+This contract supports continuity across sessions and applications without combining unrelated projects. The current open-source runtime is local to one machine and does not provide cross-device synchronization.
+
+### Structured memory and evidence retrieval
+
+- **Source** keeps inspectable user and agent messages so every derivative can be traced to a source record.
+- **Fast / Slow** are produced by the structured writer for entities, events, relationships, time, state changes, and cross-turn dependencies.
+- **Local recall** combines the embedding index, released graph-node and path scorers, and Source text matching as an evidence entry point.
+- **Result packing** ranks, deduplicates, and applies Top-K selection before returning `hits`, `evidence_windows`, `prompt_evidence`, and a per-scope `trace`.
+- **Actor provenance** remains attached through recall and knowledge curation, keeping user statements, agent proposals, and accepted decisions distinct.
+
+### Visual Atlas and Personal Knowledge
+
+Visual Atlas projects project/session hierarchy, episodes, evidence nodes, relationships, time, actor role, source application, and stable source identifiers into data that a desktop client, web client, or custom visualizer can render through the `/graph` endpoint.
+
+Personal Knowledge turns a complete Visual Atlas snapshot into readable pages across three collections:
+
+- `learned`: concepts, methods, research notes, and reusable lessons;
+- `project`: requirements, decisions, milestones, current state, incidents, and open questions;
+- `personal`: explicitly stated profile details, preferences, people, and experience.
+
+Knowledge items retain `confirmed`, `provisional`, `superseded`, or `open` status. Every claim and section must cite an existing evidence ID. Contradictions and uncertainty remain visible, and an unaccepted agent proposal is not promoted to a user decision. Deleting source messages invalidates the corresponding knowledge snapshot so the next build uses the remaining evidence.
+
+### Models, usage, and local operations
+
+Writer and Personal Knowledge policies can be configured independently. `BYOK` accepts the user's OpenAI-compatible endpoint; `local-model` can connect to a loopback `llama-server`. Embedding profiles cover different resource levels. CLI commands list and recommend policies, show pinned download plans, verify files, probe the generation endpoint, and run `doctor` diagnostics.
+
+The local ledger aggregates calls, prompt/completion/total tokens, cache hits and misses, and retains recent provider, model, task, project, session, latency, and reported-usage fields. Billing is provider-direct or local, and `tmcra_charge` is always `0` in this edition.
+
+### Integration status
+
+| Host | Automation | Current status |
+| --- | --- | --- |
+| Codex | Recall before answer; separate USER / ASSISTANT writeback; outbox retry | One-command setup; passed real local FastAPI cross-tool E2E |
+| DeepSeek Harness | Native `agent/pre-step` recall; `turn/end` writeback; multi-agent identity | Technical preview; passed real AgentLoop two-session, type, build, and package checks |
+| Claude Code | Shared owner-local hook lifecycle | Manual registration; passed shared-hook and cross-tool E2E |
+| ZCode | Shared owner-local hook lifecycle | Manual registration; clean-host packaging acceptance remains open |
+| Other tools | The same lifecycle through the loopback REST API | API available; the host still needs a verified lifecycle seam |
+
+This public repository is a source release. It does not yet include a desktop GUI, automatic scanning and selective import of historical chats, cross-device synchronization, or one-command installers for hosts such as Qimi Code and GLM Code. Hosted accounts, subscriptions and billing, staff tools, tenant management, production deployment, and operational control planes are also excluded. The exact boundary is documented in [Public release boundary](docs/PUBLIC_RELEASE_BOUNDARY.md) and enforced by `scripts/audit_public_release.py`.
 
 ## Runtime flow
 
@@ -98,6 +160,8 @@ Core endpoints:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/v1/health` | Secret-free health status |
+| `GET` | `/v1/projects` | List local projects |
+| `GET` | `/v1/sessions` | List session provenance for one project |
 | `POST` | `/v1/recall` | Recall evidence for the current user prompt |
 | `POST` | `/v1/messages` | Persist one attributed source message |
 | `GET` | `/v1/messages` | Inspect stored source messages |
@@ -105,6 +169,7 @@ Core endpoints:
 | `DELETE` | `/v1/projects/{project_id}` | Delete a project, its global derivatives, knowledge, and usage metadata |
 | `GET` | `/v1/projects/{project_id}/graph` | Build the Visual Atlas payload |
 | `POST` | `/v1/projects/{project_id}/knowledge/build` | Build Personal Knowledge |
+| `GET` | `/v1/projects/{project_id}/knowledge` | Read the latest Personal Knowledge snapshot |
 | `GET` | `/v1/usage` | Read local provider-token usage |
 
 The complete request/response contract and turn ordering are in [Local API](docs/LOCAL_API.md).
