@@ -10,54 +10,6 @@ TMCRA gives long-running agents persistent, source-traceable memory across sessi
 
 This repository includes an owner-local runtime. Clone it, choose an OpenAI-compatible API endpoint or a local generation model, and run the complete memory service on `127.0.0.1`. No TMCRA account or production server is required.
 
-## Local quick start
-
-Requirements: Python 3.12, Git with Git LFS, and at least 8 GiB system RAM. The default BYOK installation downloads the released graph scorers, one local embedding model, PyTorch, and runtime dependencies.
-
-### Windows PowerShell
-
-```powershell
-git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
-cd TMCRA-Agent-Memory
-git lfs install
-powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
-```
-
-The installer asks for a credential-free OpenAI-compatible `/v1` URL, a model ID, and the user's API key. The key is written only to `.tmcra/config/runtime/secrets/byok-api.key`; it is never serialized into the runtime JSON.
-
-### Linux or macOS
-
-```bash
-git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
-cd TMCRA-Agent-Memory
-git lfs install
-bash scripts/install-local.sh
-bash scripts/start-local.sh
-```
-
-For non-interactive installation, set `TMCRA_BYOK_BASE_URL`, `TMCRA_BYOK_MODEL`, and `TMCRA_BYOK_API_KEY` for the installer process. See [Local deployment](docs/LOCAL_DEPLOYMENT.md) for GPU selection, model profiles, local-generation mode, health checks, and uninstall behavior.
-
-After starting the API, run `.tmcra/venv/bin/python scripts/smoke_local_api.py`
-(or `.\.tmcra\venv\Scripts\python.exe .\scripts\smoke_local_api.py` on
-Windows) to verify write, recall, provenance, graph, model-generated and
-evidence-cited Personal Knowledge, usage, and deletion through one disposable
-project. It fails if knowledge generation falls back without using the
-configured model. Add `--allow-knowledge-fallback` only when you deliberately
-disabled that optional task.
-
-### Connect Codex
-
-With the local API running:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-codex-local.ps1
-```
-
-Restart Codex, open `/hooks`, review the four local lifecycle commands, and grant trust. A new prompt then recalls relevant local memory automatically; the prompt and completed answer are stored as separate role-attributed records.
-
-The source release also contains a tested DeepSeek Harness technical preview plus shared Claude Code and ZCode hook manifests. See [Local tool integrations](docs/LOCAL_INTEGRATIONS.md) for the support matrix and exact acceptance evidence.
-
 ## Feature guide
 
 | Capability | What the user gets |
@@ -150,6 +102,54 @@ flowchart LR
 ```
 
 A session is provenance within a project, not an independent recall scope. This keeps conversations in one project connected while preventing ten unrelated projects from collapsing into one graph.
+
+## Local quick start
+
+Requirements: Python 3.12, Git with Git LFS, and at least 8 GiB system RAM. The default BYOK installation downloads the released graph scorers, one local embedding model, PyTorch, and runtime dependencies.
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
+cd TMCRA-Agent-Memory
+git lfs install
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+```
+
+The installer asks for a credential-free OpenAI-compatible `/v1` URL, a model ID, and the user's API key. The key is written only to `.tmcra/config/runtime/secrets/byok-api.key`; it is never serialized into the runtime JSON.
+
+### Linux or macOS
+
+```bash
+git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
+cd TMCRA-Agent-Memory
+git lfs install
+bash scripts/install-local.sh
+bash scripts/start-local.sh
+```
+
+For non-interactive installation, set `TMCRA_BYOK_BASE_URL`, `TMCRA_BYOK_MODEL`, and `TMCRA_BYOK_API_KEY` for the installer process. See [Local deployment](docs/LOCAL_DEPLOYMENT.md) for GPU selection, model profiles, local-generation mode, health checks, and uninstall behavior.
+
+After starting the API, run `.tmcra/venv/bin/python scripts/smoke_local_api.py`
+(or `.\.tmcra\venv\Scripts\python.exe .\scripts\smoke_local_api.py` on
+Windows) to verify write, recall, provenance, graph, model-generated and
+evidence-cited Personal Knowledge, usage, and deletion through one disposable
+project. It fails if knowledge generation falls back without using the
+configured model. Add `--allow-knowledge-fallback` only when you deliberately
+disabled that optional task.
+
+### Connect Codex
+
+With the local API running:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-codex-local.ps1
+```
+
+Restart Codex, open `/hooks`, review the four local lifecycle commands, and grant trust. A new prompt then recalls relevant local memory automatically; the prompt and completed answer are stored as separate role-attributed records.
+
+The source release also contains a tested DeepSeek Harness technical preview plus shared Claude Code and ZCode hook manifests. See [Local tool integrations](docs/LOCAL_INTEGRATIONS.md) for the support matrix and exact acceptance evidence.
 
 ## Local API
 

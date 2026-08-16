@@ -10,48 +10,6 @@ TMCRA 为长期运行的 Agent 提供跨会话、跨软件且可追溯来源的�
 
 本仓库包含可独立运行的本地版。用户克隆仓库后，可填写自己的 OpenAI 兼容 API Key，也可以选择本地生成模型；完整记忆服务只监听 `127.0.0.1`，不要求注册 TMCRA 账号，也不依赖 TMCRA 生产服务器。
 
-## 本地快速安装
-
-要求：Python 3.12、带 Git LFS 的 Git，以及至少 8 GiB 系统内存。默认 BYOK 安装会下载公开图打分权重、一个本地 Embedding 模型、PyTorch 和运行依赖。
-
-### Windows PowerShell
-
-```powershell
-git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
-cd TMCRA-Agent-Memory
-git lfs install
-powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
-```
-
-安装器会询问无凭据的 OpenAI 兼容 `/v1` 地址、模型 ID 和用户自己的 API Key。Key 只写入 `.tmcra/config/runtime/secrets/byok-api.key`，不会进入运行配置 JSON。
-
-### Linux 或 macOS
-
-```bash
-git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
-cd TMCRA-Agent-Memory
-git lfs install
-bash scripts/install-local.sh
-bash scripts/start-local.sh
-```
-
-无人值守安装可向安装进程提供 `TMCRA_BYOK_BASE_URL`、`TMCRA_BYOK_MODEL` 和 `TMCRA_BYOK_API_KEY`。GPU 选择、模型档位、本地生成模式、健康检查与卸载方式见[本地部署指南](docs/LOCAL_DEPLOYMENT.zh-CN.md)。
-
-API 启动后，Linux/macOS 运行 `.tmcra/venv/bin/python scripts/smoke_local_api.py`，Windows 运行 `.\.tmcra\venv\Scripts\python.exe .\scripts\smoke_local_api.py`。它会用一个可清理的临时项目核验写入、召回、角色来源、图谱、由所选模型生成且带证据引用的知识整理、用量与删除。若知识整理退回确定性降级结果，测试默认失败；只有主动关闭该可选任务时才应添加 `--allow-knowledge-fallback`。
-
-### 接入 Codex
-
-保持本地 API 运行，再执行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-codex-local.ps1
-```
-
-重启 Codex，打开 `/hooks`，检查四个本地生命周期命令并授予信任。此后每次新问题都会自动召回相关本地记忆，问题和完成后的回答会按角色分别保存。
-
-源码版还包含已测试的 DeepSeek Harness 技术预览，以及 Claude Code、ZCode 共用 Hook 清单。支持状态与验收证据见[本地工具接入](docs/LOCAL_INTEGRATIONS.zh-CN.md)。
-
 ## 功能详解
 
 | 能力 | 用户得到的结果 |
@@ -144,6 +102,48 @@ flowchart LR
 ```
 
 Session 是项目内部的来源分组，不是第三个独立召回作用域。这样可以让同一项目的多次对话连续，又不会把十个无关项目塞进一张图。
+
+## 本地快速安装
+
+要求：Python 3.12、带 Git LFS 的 Git，以及至少 8 GiB 系统内存。默认 BYOK 安装会下载公开图打分权重、一个本地 Embedding 模型、PyTorch 和运行依赖。
+
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
+cd TMCRA-Agent-Memory
+git lfs install
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+```
+
+安装器会询问无凭据的 OpenAI 兼容 `/v1` 地址、模型 ID 和用户自己的 API Key。Key 只写入 `.tmcra/config/runtime/secrets/byok-api.key`，不会进入运行配置 JSON。
+
+### Linux 或 macOS
+
+```bash
+git clone https://github.com/reshuibuduo/TMCRA-Agent-Memory.git
+cd TMCRA-Agent-Memory
+git lfs install
+bash scripts/install-local.sh
+bash scripts/start-local.sh
+```
+
+无人值守安装可向安装进程提供 `TMCRA_BYOK_BASE_URL`、`TMCRA_BYOK_MODEL` 和 `TMCRA_BYOK_API_KEY`。GPU 选择、模型档位、本地生成模式、健康检查与卸载方式见[本地部署指南](docs/LOCAL_DEPLOYMENT.zh-CN.md)。
+
+API 启动后，Linux/macOS 运行 `.tmcra/venv/bin/python scripts/smoke_local_api.py`，Windows 运行 `.\.tmcra\venv\Scripts\python.exe .\scripts\smoke_local_api.py`。它会用一个可清理的临时项目核验写入、召回、角色来源、图谱、由所选模型生成且带证据引用的知识整理、用量与删除。若知识整理退回确定性降级结果，测试默认失败；只有主动关闭该可选任务时才应添加 `--allow-knowledge-fallback`。
+
+### 接入 Codex
+
+保持本地 API 运行，再执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-codex-local.ps1
+```
+
+重启 Codex，打开 `/hooks`，检查四个本地生命周期命令并授予信任。此后每次新问题都会自动召回相关本地记忆，问题和完成后的回答会按角色分别保存。
+
+源码版还包含已测试的 DeepSeek Harness 技术预览，以及 Claude Code、ZCode 共用 Hook 清单。支持状态与验收证据见[本地工具接入](docs/LOCAL_INTEGRATIONS.zh-CN.md)。
 
 ## 本地 API
 
