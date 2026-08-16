@@ -1,7 +1,7 @@
 # TMCRA — Local Agent Memory OS
 
 <p align="center">
-  <img src="assets/tmcra-logo.png" alt="TMCRA logo" width="420">
+  <img src="assets/tmcra-github-cover-v1.png" alt="TMCRA — Local Agent Memory OS" width="100%">
 </p>
 
 <p align="center"><a href="README.zh-CN.md">简体中文</a></p>

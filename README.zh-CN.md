@@ -1,7 +1,7 @@
 # TMCRA — 本地 Agent Memory OS
 
 <p align="center">
-  <img src="assets/tmcra-logo.png" alt="TMCRA logo" width="420">
+  <img src="assets/tmcra-github-cover-v1.png" alt="TMCRA — 本地 Agent Memory OS" width="100%">
 </p>
 
 <p align="center"><a href="README.md">English</a></p>
