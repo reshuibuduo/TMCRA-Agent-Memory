@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use TMCRA, please cite this software. OpenAI Codex assisted with development and reproducibility engineering."
 title: "TMCRA — Agent Memory Engine"
 type: software
-version: "2026.07.18"
-date-released: 2026-07-18
+version: "2026.08.16"
+date-released: 2026-08-16
 license: Apache-2.0
 authors:
   - family-names: Yu
@@ -18,7 +18,8 @@ abstract: >-
   TMCRA is an agent memory engine that builds scope-isolated, source-traceable
   memory from long-running conversations and compiles relevant evidence for
   downstream agents. This release includes the algorithm snapshot, learned
-  graph-scoring artifacts, and a reproducible LongMemEval pipeline.
+  graph-scoring artifacts, a reproducible LongMemEval pipeline, an owner-local
+  API runtime, BYOK or local-model execution, and coding-agent integrations.
 keywords:
   - agent memory
   - long-term memory

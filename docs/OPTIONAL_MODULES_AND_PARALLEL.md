@@ -240,8 +240,8 @@ Recommended baseline template:
 export TMCRA_RETRIEVAL_MODE="hybrid_node_scored"
 export TMCRA_REQUIRE_LEARNED_SCORER="1"
 export TMCRA_NODE_MODEL_DEVICE="cuda"
-export TMCRA_NODE_MODEL_PATH="models/action_frame_tunnel_graph548_tunnel_fusion_train_20260524_042557/node_scorer.pt"
-export TMCRA_PATH_MODEL_PATH="models/action_frame_tunnel_graph548_tunnel_fusion_train_20260524_042557/path_scorer.pt"
+export TMCRA_NODE_MODEL_PATH="models/tmcra_v4_longmemeval_s500_20260715/node_scorer.pt"
+export TMCRA_PATH_MODEL_PATH="models/tmcra_v4_longmemeval_s500_20260715/path_scorer.pt"
 
 export TMCRA_WRITER_MODEL="deepseek-chat"
 export TMCRA_WRITER_MAX_TOKENS="512"

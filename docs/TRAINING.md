@@ -20,13 +20,9 @@ The released model directory contains two main runtime scorers:
 - `node_scorer.pt`: scores candidate memory nodes.
 - `path_scorer.pt`: scores graph paths and tunnel links between memory nodes.
 
-The training output also includes:
-
-- best checkpoints
-- last checkpoints
-- epoch and step checkpoints
-- training summary and logs
-- export manifest
+The public source release contains inference checkpoints only. Optimizer state,
+epoch/step checkpoints, launch scripts, raw logs, partial summaries, and
+machine-specific run metadata are intentionally excluded.
 
 ## Training Data Direction
 
@@ -69,12 +65,12 @@ This separation is important because a long-memory system needs two different ab
 - write useful memory units from conversation
 - retrieve and connect the right units later under noise
 
-## Training Output Included
+## Public Inference Output
 
-The packaged model output is located at:
+The published inference package is located at:
 
 ```text
-models/action_frame_tunnel_graph548_tunnel_fusion_train_20260524_042557/
+models/tmcra_v4_longmemeval_s500_20260715/
 ```
 
 Runtime files:
@@ -82,21 +78,17 @@ Runtime files:
 ```text
 node_scorer.pt
 path_scorer.pt
-export_manifest.json
+tmcra_v3_reranker.pt
+TMCRA_MODEL_MANIFEST.json
 ```
 
-Full training trace:
+`TMCRA_MODEL_MANIFEST.json` records byte sizes, SHA-256 hashes, safe-loading
+requirements, and the public checkpoint keys. The local runtime verifies this
+manifest before loading any graph scorer.
 
-```text
-checkpoints/
-node_scorer_best.pt
-path_scorer_best.pt
-node_scorer_last.pt
-path_scorer_last.pt
-train_summary.json
-train.log
-training_issues.jsonl
-```
+The full training trace is not part of this owner-local distribution. This
+keeps deployment artifacts separate from resumable training state and
+machine-specific operations data.
 
 ## Current Training Lessons
 

@@ -137,8 +137,16 @@ _TEMPORAL_ROUTER_DEFAULT_QUERY_MIN_CONFIDENCE = 0.85
 _TEMPORAL_ROUTER_DEFAULT_QUERY_INTENT_MIN_CONFIDENCE = 0.60
 _EMBEDDER_INDEX_DISABLED_MODES = {"", "off", "disabled", "none", "false", "0"}
 _EMBEDDER_INDEX_BGE_M3_MODES = {"bge", "bge_m3", "bge-m3", "baai_bge_m3", "baai/bge-m3"}
+_EMBEDDER_INDEX_TRANSFORMER_MODES = {
+    *_EMBEDDER_INDEX_BGE_M3_MODES,
+    "transformers",
+    "local_transformers",
+    "local-transformers",
+    "e5",
+}
 _EMBEDDER_INDEX_VERSION = "write_hash_sparse_v1"
 _EMBEDDER_INDEX_BGE_M3_VERSION = "write_bge_m3_dense_sparse_v1"
+_EMBEDDER_INDEX_TRANSFORMER_VERSION = "write_local_transformers_dense_sparse_v2"
 _EMBEDDER_MODEL_CACHE: Dict[str, Any] = {}
 _HYBRID_SYMBOLIC_STOPWORDS = {
     "a",
@@ -1372,8 +1380,18 @@ def _embedder_index_uses_bge_m3(mode: Any) -> bool:
     return _normalize(mode).replace("-", "_") in {item.replace("-", "_") for item in _EMBEDDER_INDEX_BGE_M3_MODES}
 
 
+def _embedder_index_uses_transformer(mode: Any) -> bool:
+    return _normalize(mode).replace("-", "_") in {
+        item.replace("-", "_") for item in _EMBEDDER_INDEX_TRANSFORMER_MODES
+    }
+
+
 def _embedder_index_version_for_mode(mode: Any) -> str:
-    return _EMBEDDER_INDEX_BGE_M3_VERSION if _embedder_index_uses_bge_m3(mode) else _EMBEDDER_INDEX_VERSION
+    if _embedder_index_uses_bge_m3(mode):
+        return _EMBEDDER_INDEX_BGE_M3_VERSION
+    if _embedder_index_uses_transformer(mode):
+        return _EMBEDDER_INDEX_TRANSFORMER_VERSION
+    return _EMBEDDER_INDEX_VERSION
 
 
 def _embedder_index_text_items(value: Any, *, max_items: int = 64) -> List[str]:
@@ -1436,15 +1454,32 @@ def _embedder_index_term_weights(value: Any, *, max_terms: int = 96) -> Dict[str
     return {term: round(float(weight) / norm, 6) for term, weight in ranked}
 
 
-def _embedder_dense_vectors_for_texts(texts: Sequence[str], *, mode: str) -> tuple[List[List[float]], Dict[str, Any]]:
+def _embedder_dense_vectors_for_texts(
+    texts: Sequence[str],
+    *,
+    mode: str,
+    text_kind: str = "document",
+) -> tuple[List[List[float]], Dict[str, Any]]:
     normalized_mode = _normalize(mode)
-    if not _embedder_index_uses_bge_m3(normalized_mode):
+    if not _embedder_index_uses_transformer(normalized_mode):
         return [[] for _ in texts], {"write_embedder_dense_enabled": False}
-    clean_texts = [_clean_text(text) for text in texts]
+    normalized_kind = "query" if _normalize(text_kind) == "query" else "document"
+    prefix_name = (
+        "TMCRA_EMBEDDER_QUERY_PREFIX"
+        if normalized_kind == "query"
+        else "TMCRA_EMBEDDER_DOCUMENT_PREFIX"
+    )
+    prefix = os.getenv(prefix_name, "")
+    clean_texts = [f"{prefix}{_clean_text(text)}" for text in texts]
+    pooling = _normalize(os.getenv("TMCRA_EMBEDDER_POOLING", "mean")) or "mean"
+    if pooling not in {"mean", "cls"}:
+        pooling = "mean"
     metadata: Dict[str, Any] = {
         "write_embedder_dense_enabled": False,
-        "write_embedder_dense_backend": "bge_m3_transformers",
+        "write_embedder_dense_backend": "local_transformers",
         "write_embedder_dense_model": _clean_text(os.getenv("TMCRA_EMBEDDER_MODEL_PATH", "")) or "BAAI/bge-m3",
+        "write_embedder_dense_pooling": pooling,
+        "write_embedder_dense_text_kind": normalized_kind,
     }
     if not any(clean_texts):
         metadata["write_embedder_dense_error"] = "empty_texts"
@@ -1463,7 +1498,7 @@ def _embedder_dense_vectors_for_texts(texts: Sequence[str], *, mode: str) -> tup
         max_length = max(64, int(os.getenv("TMCRA_EMBEDDER_MODEL_MAX_LENGTH", "512") or 512))
     except (TypeError, ValueError):
         max_length = 512
-    cache_key = f"bge_m3::{model_name}::{device}::{max_length}"
+    cache_key = f"local_transformers::{model_name}::{device}::{max_length}"
     try:
         cached = _EMBEDDER_MODEL_CACHE.get(cache_key)
         if cached is None:
@@ -1494,7 +1529,9 @@ def _embedder_dense_vectors_for_texts(texts: Sequence[str], *, mode: str) -> tup
             output = model(**encoded)
             hidden = output.last_hidden_state
             mask = encoded.get("attention_mask")
-            if mask is not None:
+            if pooling == "cls":
+                pooled = hidden[:, 0]
+            elif mask is not None:
                 mask = mask.unsqueeze(-1).expand(hidden.size()).float()
                 pooled = torch.sum(hidden * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
             else:
@@ -1523,14 +1560,16 @@ def _prewarm_embedder_dense_if_requested(*, mode: str) -> Dict[str, Any]:
     if flag in _EMBEDDER_INDEX_DISABLED_MODES or flag not in {"1", "true", "yes", "on", "auto"}:
         return {"embedder_prewarm_enabled": False}
     normalized_mode = _normalize(mode)
-    if not _embedder_index_uses_bge_m3(normalized_mode):
+    if not _embedder_index_uses_transformer(normalized_mode):
         return {
             "embedder_prewarm_enabled": False,
             "embedder_prewarm_reason": "mode_not_dense",
             "embedder_prewarm_mode": normalized_mode or "off",
         }
     warmup_text = _clean_text(os.getenv("TMCRA_EMBEDDER_PREWARM_TEXT", "")) or "tmcra memory retrieval warmup"
-    vectors, metadata = _embedder_dense_vectors_for_texts([warmup_text], mode=normalized_mode)
+    vectors, metadata = _embedder_dense_vectors_for_texts(
+        [warmup_text], mode=normalized_mode, text_kind="query"
+    )
     return {
         "embedder_prewarm_enabled": bool(vectors and vectors[0]),
         "embedder_prewarm_mode": normalized_mode,
@@ -1606,6 +1645,7 @@ def _apply_write_embedder_index_to_graph(
     dense_vectors, dense_metadata = _embedder_dense_vectors_for_texts(
         [index_text for _, index_text, _ in index_rows],
         mode=normalized_mode,
+        text_kind="document",
     )
     metadata.update(dense_metadata)
     for row_index, (record, _, terms) in enumerate(index_rows):
@@ -1672,7 +1712,9 @@ def _embedder_index_recall_event_ids(
     if not _embedder_index_enabled(normalized_mode):
         return {"event_ids": [], "metadata": metadata}
     query_terms = _embedder_index_term_weights(query, max_terms=max_terms)
-    query_vectors, query_dense_metadata = _embedder_dense_vectors_for_texts([query], mode=normalized_mode)
+    query_vectors, query_dense_metadata = _embedder_dense_vectors_for_texts(
+        [query], mode=normalized_mode, text_kind="query"
+    )
     query_vector = query_vectors[0] if query_vectors else []
     metadata.update(
         {

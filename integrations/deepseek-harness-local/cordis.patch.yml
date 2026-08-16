@@ -1,0 +1,7 @@
+- insert:
+    - id: tmcra-local-memory
+      name: tmcra-deepseek-harness-local-memory
+      config:
+        recallFailureMode: continue
+        recallTimeoutMs: 120000
+        ingestTimeoutMs: 120000

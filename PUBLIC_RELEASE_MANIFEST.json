@@ -1,0 +1,73 @@
+{
+  "schema_version": "tmcra.public-release-manifest.1",
+  "distribution": "owner-local-source",
+  "allowed_top_level_directories": [
+    ".agents",
+    ".github",
+    "assets",
+    "benchmarks",
+    "code",
+    "docs",
+    "integrations",
+    "models",
+    "results",
+    "runtime",
+    "scripts"
+  ],
+  "allowed_root_files": [
+    ".gitattributes",
+    ".gitignore",
+    "AUTHORS.md",
+    "CHANGELOG.md",
+    "CITATION.cff",
+    "LICENSE",
+    "NOTICE",
+    "PUBLIC_RELEASE_MANIFEST.json",
+    "README.md",
+    "README.zh-CN.md",
+    "SECURITY.md"
+  ],
+  "required_paths": [
+    "runtime/pyproject.toml",
+    "runtime/src/tmcra_local/api.py",
+    "runtime/src/tmcra_local/engine.py",
+    "scripts/install-local.ps1",
+    "scripts/install-local.sh",
+    "scripts/start-local.ps1",
+    "scripts/start-local.sh",
+    "scripts/uninstall-local.ps1",
+    "scripts/uninstall-local.sh",
+    "scripts/audit_public_release.py",
+    "scripts/smoke_local_api.py",
+    "scripts/install-codex-local.ps1",
+    "scripts/install-codex-local.sh",
+    "scripts/install-deepseek-harness-local.ps1",
+    "scripts/install-deepseek-harness-local.sh",
+    "integrations/local-agent-hooks/hooks/hooks.json",
+    "integrations/local-agent-hooks/lib/local_memory.mjs",
+    "integrations/deepseek-harness-local/src/index.ts",
+    "docs/LOCAL_DEPLOYMENT.md",
+    "docs/LOCAL_DEPLOYMENT.zh-CN.md",
+    "docs/LOCAL_API.md",
+    "docs/LOCAL_API.zh-CN.md",
+    "docs/LOCAL_INTEGRATIONS.md",
+    "docs/LOCAL_INTEGRATIONS.zh-CN.md",
+    "docs/PUBLIC_RELEASE_BOUNDARY.md",
+    "docs/PUBLIC_RELEASE_BOUNDARY.zh-CN.md",
+    "models/tmcra_v4_longmemeval_s500_20260715/TMCRA_MODEL_MANIFEST.json"
+  ],
+  "excluded_capabilities": [
+    "hosted-account-control-plane",
+    "hosted-billing-and-subscriptions",
+    "staff-and-tenant-administration",
+    "production-deployment-secrets",
+    "production-observability-and-operations",
+    "private-training-corpora-and-run-state",
+    "desktop-installer-binaries"
+  ],
+  "network_contract": {
+    "local_api_bind": "127.0.0.1",
+    "silent_cloud_fallback": false,
+    "external_generation": "explicit-user-BYOK-only"
+  }
+}

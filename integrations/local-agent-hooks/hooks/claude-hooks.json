@@ -1,0 +1,58 @@
+{
+  "description": "TMCRA owner-local lifecycle hooks for Claude Code.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.mjs", "session-start", "claude-code"],
+            "timeout": 12,
+            "statusMessage": "Checking local TMCRA memory"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.mjs", "user-prompt", "claude-code"],
+            "timeout": 120,
+            "statusMessage": "Recalling local TMCRA memory"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.mjs", "stop", "claude-code"],
+            "timeout": 120,
+            "statusMessage": "Saving the completed turn locally"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.mjs", "stop-failure", "claude-code"],
+            "timeout": 12,
+            "statusMessage": "Closing the local memory turn"
+          }
+        ]
+      }
+    ]
+  }
+}

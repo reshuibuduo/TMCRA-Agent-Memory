@@ -11,9 +11,22 @@ Thumbs.db
 !*.env.example
 *.key
 *.pem
+*.token
+*.p12
+*.pfx
+credentials.json
+secrets.json
 
 # Generated benchmark/runtime data
 .pytest_cache/
+.tmcra/
+runtime/.venv/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+local-runtime.json
+*.key
+.env
 .venv/
 runs/
 data/
@@ -23,6 +36,10 @@ artifacts/
 *.sqlite3
 *.db
 *.log
+*.egg-info/
+node_modules/
+dist/
+build/
 
 # Downloaded third-party model snapshots. TMCRA's tracked release weights
 # remain under models/ and are explicitly staged through Git LFS.

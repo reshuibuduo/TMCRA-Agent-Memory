@@ -1,0 +1,27 @@
+{
+  "name": "tmcra-local-memory",
+  "version": "0.1.0",
+  "description": "Automatic owner-local TMCRA recall and role-separated writeback.",
+  "author": {
+    "name": "TMCRA"
+  },
+  "homepage": "https://github.com/reshuibuduo/TMCRA-Agent-Memory",
+  "keywords": [
+    "memory",
+    "local",
+    "codex",
+    "agent"
+  ],
+  "interface": {
+    "displayName": "TMCRA Local Memory",
+    "shortDescription": "Local recall and capture for coding agents.",
+    "longDescription": "Recalls relevant owner-global and current-project memory before an answer, then stores user and assistant messages as separate local records.",
+    "developerName": "TMCRA",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "brandColor": "#30373D"
+  }
+}

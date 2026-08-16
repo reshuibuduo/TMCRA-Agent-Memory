@@ -27,7 +27,7 @@ jobs:
           cache-dependency-path: benchmarks/longmemeval/requirements.txt
 
       - name: Install offline test dependency
-        run: python -m pip install pytest==9.0.2
+        run: python -m pip install pytest==9.0.3
 
       - name: Compile Python sources
         run: python -m compileall -q src scripts tests

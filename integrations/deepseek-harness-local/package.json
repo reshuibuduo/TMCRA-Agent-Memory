@@ -1,0 +1,76 @@
+{
+  "name": "tmcra-deepseek-harness-local-memory",
+  "version": "0.1.0",
+  "description": "Owner-local TMCRA recall and role-separated writeback for DeepSeek Harness",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist/index.mjs",
+    "dist/index.d.mts",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "build:silent": "tsdown --logLevel silent",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "pack:check": "npm pack --dry-run --json --silent",
+    "prepack": "npm run --silent build:silent"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-memory",
+    "local-first",
+    "tmcra"
+  ],
+  "author": "Yu Haoxin",
+  "contributors": [
+    "Codex"
+  ],
+  "homepage": "https://github.com/reshuibuduo/TMCRA-Agent-Memory",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reshuibuduo/TMCRA-Agent-Memory.git",
+    "directory": "integrations/deepseek-harness-local"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0 <5",
+    "@deepseek-ai/dsh-agent": ">=0.1.0-rc.5 <0.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.5 <0.2",
+    "@deepseek-ai/dsh-session": ">=0.1.0-rc.5 <0.2"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-loop": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-loop-testkit": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "0.1.0-rc.6",
+    "@types/node": "^24.0.0",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}

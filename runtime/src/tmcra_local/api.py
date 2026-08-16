@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import hmac
+import logging
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Literal
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from .auth import ensure_local_token
+from .core import ProductWriterError
+from .engine import LocalEngineError, LocalMemoryEngine
+
+
+LOGGER = logging.getLogger("tmcra_local.api")
+
+
+class MessageIn(BaseModel):
+    project_id: str = Field(min_length=1, max_length=256)
+    session_id: str = Field(min_length=1, max_length=512)
+    role: Literal["user", "assistant", "system", "tool"]
+    content: str = Field(min_length=1, max_length=1_000_000)
+    source_app: str = Field(default="manual", min_length=1, max_length=80)
+    native_thread_id: str = Field(default="", max_length=512)
+    native_message_id: str = Field(default="", max_length=512)
+    project_title: str = Field(default="", max_length=200)
+    session_title: str = Field(default="", max_length=200)
+    occurred_at: str = Field(default="", max_length=80)
+    actor: dict[str, Any] = Field(default_factory=dict)
+    visibility: Literal["project", "global", "both"] = "project"
+    message_id: str = Field(default="", max_length=512)
+
+
+class RecallIn(BaseModel):
+    project_id: str = Field(min_length=1, max_length=256)
+    query: str = Field(min_length=1, max_length=100_000)
+    top_k: int = Field(default=8, ge=1, le=32)
+
+
+def create_app(
+    config_path: str | Path,
+    *,
+    verify_models: bool = True,
+) -> FastAPI:
+    engine = LocalMemoryEngine(config_path, verify_models=verify_models)
+    installation = engine.config.get("installation")
+    if not isinstance(installation, Mapping):
+        raise RuntimeError("local runtime installation config is missing")
+    token_file, token, _ = ensure_local_token(str(installation.get("config_root") or ""))
+
+    app = FastAPI(
+        title="TMCRA Local Memory API",
+        version="0.1.0",
+        description=(
+            "Loopback-only owner-local API. It has no TMCRA cloud account, "
+            "subscription, billing, staff, or tenant endpoints."
+        ),
+    )
+    app.state.engine = engine
+    app.state.local_token_path = str(token_file)
+
+    def authorize(authorization: str = Header(default="")) -> None:
+        scheme, _, supplied = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, token):
+            raise HTTPException(status_code=401, detail="invalid local bearer token")
+
+    @app.exception_handler(Exception)
+    async def local_error_handler(_, exc: Exception) -> JSONResponse:
+        if isinstance(exc, HTTPException):
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        if isinstance(exc, (LocalEngineError, ProductWriterError, ValueError)):
+            return JSONResponse(
+                status_code=400,
+                content={"error": exc.__class__.__name__, "detail": str(exc)},
+            )
+        LOGGER.exception("unhandled local API failure", exc_info=exc)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "InternalServerError", "detail": "local runtime failure"},
+        )
+
+    @app.get("/v1/health")
+    def health() -> dict[str, Any]:
+        return engine.health()
+
+    @app.get("/v1/projects", dependencies=[Depends(authorize)])
+    def projects() -> dict[str, Any]:
+        return {"projects": engine.store.projects()}
+
+    @app.get("/v1/sessions", dependencies=[Depends(authorize)])
+    def sessions(project_id: str = Query(default="")) -> dict[str, Any]:
+        return {"sessions": engine.store.sessions(project_id or None)}
+
+    @app.get("/v1/messages", dependencies=[Depends(authorize)])
+    def messages(
+        project_id: str = Query(default=""),
+        session_id: str = Query(default=""),
+        limit: int = Query(default=200, ge=1, le=500),
+    ) -> dict[str, Any]:
+        return {
+            "messages": engine.store.messages(
+                project_id=project_id,
+                session_id=session_id,
+                limit=limit,
+            )
+        }
+
+    @app.post("/v1/messages", dependencies=[Depends(authorize)])
+    def ingest(payload: MessageIn) -> dict[str, Any]:
+        values = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+        if not values["native_thread_id"]:
+            values["native_thread_id"] = values["session_id"]
+        return engine.ingest_message(**values)
+
+    @app.delete("/v1/messages/{message_id}", dependencies=[Depends(authorize)])
+    def delete_message(message_id: str) -> dict[str, Any]:
+        return engine.delete_message(message_id)
+
+    @app.delete("/v1/projects/{project_id}", dependencies=[Depends(authorize)])
+    def delete_project(project_id: str) -> dict[str, Any]:
+        return engine.delete_project(project_id)
+
+    @app.post("/v1/recall", dependencies=[Depends(authorize)])
+    def recall(payload: RecallIn) -> dict[str, Any]:
+        return engine.recall(
+            project_id=payload.project_id, query=payload.query, top_k=payload.top_k
+        )
+
+    @app.get("/v1/projects/{project_id}/graph", dependencies=[Depends(authorize)])
+    def graph(project_id: str) -> dict[str, Any]:
+        return engine.visual_atlas(project_id=project_id)
+
+    @app.post(
+        "/v1/projects/{project_id}/knowledge/build",
+        dependencies=[Depends(authorize)],
+    )
+    def build_knowledge(project_id: str) -> dict[str, Any]:
+        return engine.build_knowledge(project_id=project_id)
+
+    @app.get("/v1/projects/{project_id}/knowledge", dependencies=[Depends(authorize)])
+    def knowledge(project_id: str) -> dict[str, Any]:
+        result = engine.knowledge(project_id=project_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="knowledge projection does not exist")
+        return result
+
+    @app.get("/v1/usage", dependencies=[Depends(authorize)])
+    def usage(
+        project_id: str = Query(default=""),
+        limit: int = Query(default=50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        return engine.usage(project_id=project_id, limit=limit)
+
+    return app
+
+
+__all__ = ["MessageIn", "RecallIn", "create_app"]
